@@ -29,6 +29,7 @@ FALLBACK_TO_ADMIN = "Передаю ваш вопрос администрато
 ACTIVE_PARENT_STATUS = "✅ Активен как родительский чат"
 MODERATION_ONLY_STATUS = "🛡 Активен только как модератор"
 IGNORED_STATUS = "⏸ Не подключён"
+MESSAGE_BUFFER_SECONDS = float(os.getenv("MESSAGE_BUFFER_SECONDS", "4"))
 
 
 @dataclass(frozen=True)
@@ -226,6 +227,7 @@ class OpenAIService:
         system = (
             f"Ты отвечаешь от имени студии {self.config.studio_name}. Алиасы: {self.config.studio_aliases}. "
             f"Администраторы: {self.config.admin_names}. Текущий чат/группа: {chat_title or 'без названия'}. {self.now_text()} "
+            "Сообщение родителя могло быть собрано из нескольких коротких сообщений подряд. Отвечай на общий смысл, а не на отдельные обрывки. "
             "Отвечай только по этой студии. Другие студии, филиалы и площадки полностью игнорируй, даже если они есть в контексте. "
             "Никогда не предлагай выбрать другую студию. Если вопрос про дату без года, используй текущий год только как ориентир, но не утверждай его, если в базе нет года. "
             "Если в базе несколько групп нужной студии, выбери по названию текущего чата. "
@@ -243,6 +245,21 @@ AD_PATTERNS = [re.compile(r"https?://", re.I), re.compile(r"t\.me/", re.I), re.c
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def join_message_parts(parts: list[str]) -> str:
+    result = ""
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if part in {".", ",", "?", "!", ":", ";", "…"}:
+            result = result.rstrip() + part
+        elif not result:
+            result = part
+        else:
+            result += " " + part
+    return normalize_text(result)
 
 
 def is_admin(user_id: int | None, config: Config) -> bool:
@@ -339,6 +356,7 @@ async def send_startup_report(bot: Bot, db: Database, config: Config) -> None:
 async def main() -> None:
     config = load_config(); db = Database(config.database_path, config.default_mode); ai = OpenAIService(config)
     bot = Bot(config.bot_token); me = await bot.get_me(); dp = Dispatcher(); router = Router()
+    message_buffers: dict[tuple[int, int], dict[str, object]] = {}
 
     @router.message(Command("start"))
     async def start(message: Message) -> None:
@@ -429,6 +447,29 @@ async def main() -> None:
         await notify_admins(bot, config, f"Модерация: {reason}\nЧат: {message.chat.title or message.chat.id}\nТекст: {text[:500]}")
         return True
 
+    async def process_parent_question(message: Message, text: str) -> None:
+        if not text or text.startswith("/") or not is_likely_question(text) or not bot_is_active(db, config):
+            return
+        search_text = f"{config.studio_name}\n{config.studio_aliases}\n{message.chat.title or ''}\n{text}\n{ai.now_text()}"
+        context = find_relevant_context(db, await ai.embedding(search_text))
+        if not context:
+            db.save_question(message.chat.id, message.from_user.id if message.from_user else None, message.message_id, text, "sent_to_admin")
+            await message.reply(FALLBACK_TO_ADMIN); await notify_admins(bot, config, f"Вопрос родителя:\n{text}\n\nЧат: {message.chat.title or message.chat.id}"); return
+        answer = await ai.answer(text, context, message.chat.title)
+        db.save_question(message.chat.id, message.from_user.id if message.from_user else None, message.message_id, text, "sent_to_admin" if answer == FALLBACK_TO_ADMIN else "answered")
+        if answer == FALLBACK_TO_ADMIN: await notify_admins(bot, config, f"Вопрос родителя:\n{text}\n\nЧат: {message.chat.title or message.chat.id}")
+        await message.reply(answer)
+
+    async def flush_message_buffer(key: tuple[int, int]) -> None:
+        await asyncio.sleep(MESSAGE_BUFFER_SECONDS)
+        entry = message_buffers.pop(key, None)
+        if not entry:
+            return
+        text = join_message_parts(entry["parts"])  # type: ignore[arg-type]
+        message = entry["message"]  # type: ignore[assignment]
+        logger.info("Buffered message chat=%s user=%s text=%s", key[0], key[1], text[:120])
+        await process_parent_question(message, text)
+
     @router.message()
     async def all_messages(message: Message) -> None:
         if await handle_knowledge_upload(message): return
@@ -440,16 +481,17 @@ async def main() -> None:
         if chat_type in {"parent", "moderation"} and await moderate_if_needed(message): return
         if chat_type != "parent": return
         text = message.text or message.caption or ""
-        if not text or text.startswith("/") or not is_likely_question(text) or not bot_is_active(db, config): return
-        search_text = f"{config.studio_name}\n{config.studio_aliases}\n{message.chat.title or ''}\n{text}\n{ai.now_text()}"
-        context = find_relevant_context(db, await ai.embedding(search_text))
-        if not context:
-            db.save_question(message.chat.id, message.from_user.id if message.from_user else None, message.message_id, text, "sent_to_admin")
-            await message.reply(FALLBACK_TO_ADMIN); await notify_admins(bot, config, f"Вопрос родителя:\n{text}\n\nЧат: {message.chat.title or message.chat.id}"); return
-        answer = await ai.answer(text, context, message.chat.title)
-        db.save_question(message.chat.id, message.from_user.id if message.from_user else None, message.message_id, text, "sent_to_admin" if answer == FALLBACK_TO_ADMIN else "answered")
-        if answer == FALLBACK_TO_ADMIN: await notify_admins(bot, config, f"Вопрос родителя:\n{text}\n\nЧат: {message.chat.title or message.chat.id}")
-        await message.reply(answer)
+        if not text or text.startswith("/"): return
+
+        user_id = message.from_user.id if message.from_user else 0
+        key = (message.chat.id, user_id)
+        old = message_buffers.get(key)
+        if old and old.get("task"):
+            old["task"].cancel()  # type: ignore[union-attr]
+        parts = list(old["parts"]) if old else []  # type: ignore[index]
+        parts.append(text)
+        task = asyncio.create_task(flush_message_buffer(key))
+        message_buffers[key] = {"parts": parts, "message": message, "task": task}
 
     dp.include_router(router); await send_startup_report(bot, db, config); await dp.start_polling(bot)
 
