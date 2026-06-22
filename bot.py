@@ -101,8 +101,7 @@ class Database:
                 chat_id INTEGER PRIMARY KEY,
                 type TEXT NOT NULL,
                 title TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT
+                created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS knowledge_items (
@@ -193,9 +192,9 @@ class Database:
 
     def add_chat(self, chat_id: int, chat_type: str, title: str | None) -> None:
         self.conn.execute(
-            "INSERT INTO chats(chat_id, type, title, created_at, updated_at) VALUES(?, ?, ?, ?, ?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET type=excluded.type, title=excluded.title, updated_at=excluded.updated_at",
-            (chat_id, chat_type, title, utc_now(), utc_now()),
+            "INSERT INTO chats(chat_id, type, title, created_at) VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET type=excluded.type, title=excluded.title",
+            (chat_id, chat_type, title, utc_now()),
         )
         self.conn.commit()
 
