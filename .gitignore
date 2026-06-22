@@ -2,7 +2,10 @@ __pycache__/
 *.pyc
 .venv/
 .env
+data/
+/app/data/
 studio_admin.db
+*.db
 *.sqlite
 *.sqlite3
 .DS_Store
