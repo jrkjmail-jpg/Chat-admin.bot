@@ -6,9 +6,8 @@ import re
 import sqlite3
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import UTC, datetime, time
 from pathlib import Path
-from typing import Any
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -16,7 +15,13 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    ChatMemberUpdated,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from pypdf import PdfReader
@@ -26,6 +31,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 FALLBACK_TO_ADMIN = "Передаю ваш вопрос администратору."
+ACTIVE_PARENT_STATUS = "✅ Активен как родительский чат"
+MODERATION_ONLY_STATUS = "🛡 Активен только как модератор"
+IGNORED_STATUS = "⏸ Не подключён"
 
 
 @dataclass(frozen=True)
@@ -39,6 +47,10 @@ class Config:
     embedding_model: str
     default_mode: str
     timezone: str
+
+
+def utc_now() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 def parse_int_set(value: str | None) -> set[int]:
@@ -71,15 +83,13 @@ def load_config() -> Config:
 
 class Database:
     def __init__(self, path: str, default_mode: str) -> None:
-        self.path = path
-        self.default_mode = default_mode
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
+        self.default_mode = default_mode
         self.init_schema()
 
     def init_schema(self) -> None:
-        cur = self.conn.cursor()
-        cur.executescript(
+        self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -140,7 +150,6 @@ class Database:
             );
             """
         )
-        self.conn.commit()
         self.set_default_settings()
         self.set_default_working_hours()
 
@@ -181,8 +190,9 @@ class Database:
 
     def add_chat(self, chat_id: int, chat_type: str, title: str | None) -> None:
         self.conn.execute(
-            "INSERT INTO chats(chat_id, type, title, created_at) VALUES(?, ?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET type=excluded.type, title=excluded.title",
-            (chat_id, chat_type, title, datetime.utcnow().isoformat()),
+            "INSERT INTO chats(chat_id, type, title, created_at) VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET type=excluded.type, title=excluded.title",
+            (chat_id, chat_type, title, utc_now()),
         )
         self.conn.commit()
 
@@ -190,10 +200,10 @@ class Database:
         row = self.conn.execute("SELECT type FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
         return row["type"] if row else None
 
-    def add_pending_knowledge(self, title: str, content: str, chat_id: int, message_id: int) -> int:
+    def add_pending_knowledge(self, title: str, content: str, chat_id: int | None, message_id: int | None) -> int:
         cur = self.conn.execute(
             "INSERT INTO pending_knowledge(title, content, source_chat_id, source_message_id, created_at) VALUES(?, ?, ?, ?, ?)",
-            (title, content, chat_id, message_id, datetime.utcnow().isoformat()),
+            (title, content, chat_id, message_id, utc_now()),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -213,7 +223,7 @@ class Database:
                 row["source_chat_id"],
                 row["source_message_id"],
                 json.dumps(embedding) if embedding else None,
-                datetime.utcnow().isoformat(),
+                utc_now(),
             ),
         )
         self.conn.execute("DELETE FROM pending_knowledge WHERE id = ?", (item_id,))
@@ -228,21 +238,19 @@ class Database:
         return self.conn.execute("SELECT * FROM knowledge_items WHERE embedding IS NOT NULL").fetchall()
 
     def list_recent_knowledge(self, limit: int = 5) -> list[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM knowledge_items ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
+        return self.conn.execute("SELECT * FROM knowledge_items ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
     def save_question(self, chat_id: int, user_id: int | None, message_id: int, question: str, status: str) -> None:
         self.conn.execute(
             "INSERT INTO questions(chat_id, user_id, message_id, question, status, created_at) VALUES(?, ?, ?, ?, ?, ?)",
-            (chat_id, user_id, message_id, question, status, datetime.utcnow().isoformat()),
+            (chat_id, user_id, message_id, question, status, utc_now()),
         )
         self.conn.commit()
 
     def save_moderation_log(self, chat_id: int, user_id: int | None, message_id: int, reason: str, text: str | None) -> None:
         self.conn.execute(
             "INSERT INTO moderation_logs(chat_id, user_id, message_id, reason, text, created_at) VALUES(?, ?, ?, ?, ?, ?)",
-            (chat_id, user_id, message_id, reason, text, datetime.utcnow().isoformat()),
+            (chat_id, user_id, message_id, reason, text, utc_now()),
         )
         self.conn.commit()
 
@@ -266,8 +274,7 @@ class Database:
         end_h, end_m = map(int, row["end_time"].split(":"))
         start = time(start_h, start_m)
         end = time(end_h, end_m)
-        current = now.time()
-        return start <= current <= end
+        return start <= now.time() <= end
 
 
 class OpenAIService:
@@ -324,15 +331,7 @@ class OpenAIService:
         return answer or FALLBACK_TO_ADMIN
 
 
-BAD_WORDS = {
-    "дурак",
-    "идиот",
-    "тупой",
-    "тупая",
-    "дебил",
-    "лох",
-}
-
+BAD_WORDS = {"дурак", "идиот", "тупой", "тупая", "дебил", "лох"}
 AD_PATTERNS = [
     re.compile(r"https?://", re.IGNORECASE),
     re.compile(r"t\.me/", re.IGNORECASE),
@@ -371,6 +370,26 @@ def knowledge_keyboard(item_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="❌ Не добавлять", callback_data=f"kb:reject:{item_id}")],
         ]
     )
+
+
+def chat_activation_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Активировать как родительский", callback_data=f"chat:parent:{chat_id}")],
+            [InlineKeyboardButton(text="🛡 Только модерация", callback_data=f"chat:moderation:{chat_id}")],
+            [InlineKeyboardButton(text="⏸ Не подключать", callback_data=f"chat:ignored:{chat_id}")],
+        ]
+    )
+
+
+def chat_status_text(chat_type: str | None) -> str:
+    if chat_type == "parent":
+        return ACTIVE_PARENT_STATUS
+    if chat_type == "moderation":
+        return MODERATION_ONLY_STATUS
+    if chat_type == "ignored":
+        return IGNORED_STATUS
+    return "🟡 Ожидает решения администратора"
 
 
 async def extract_pdf_text(bot: Bot, file_id: str) -> str:
@@ -417,10 +436,10 @@ def bot_is_active(db: Database, config: Config) -> bool:
     return False
 
 
-async def notify_admins(bot: Bot, config: Config, text: str) -> None:
+async def notify_admins(bot: Bot, config: Config, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
     for admin_id in config.admin_ids:
         try:
-            await bot.send_message(admin_id, text)
+            await bot.send_message(admin_id, text, reply_markup=reply_markup)
         except Exception as exc:
             logger.warning("Cannot notify admin %s: %s", admin_id, exc)
 
@@ -431,19 +450,51 @@ async def main() -> None:
     openai_service = OpenAIService(config.openai_api_key, config.openai_model, config.embedding_model)
 
     bot = Bot(config.bot_token)
+    me = await bot.get_me()
     dp = Dispatcher()
     router = Router()
 
     @router.message(Command("start"))
     async def start(message: Message) -> None:
-        await message.answer(
-            "Здравствуйте! Я AI-администратор студии.\n\n"
-            "Администратор может настроить меня командами:\n"
-            "/set_service_chat — назначить сервисный чат\n"
-            "/add_parent_chat — назначить родительский чат\n"
-            "/mode always|outside_working_hours|working_hours_only|off — режим работы\n"
-            "/hours — показать рабочее время"
+        if message.chat.type == ChatType.PRIVATE and is_admin(message.from_user.id if message.from_user else None, config):
+            await message.answer(
+                "Здравствуйте! Это личный кабинет AI-администратора студии.\n\n"
+                "Сюда можно отправлять текст и PDF для базы знаний.\n"
+                "Когда я подготовлю материал, нажмите «Добавить в базу».\n\n"
+                "Если добавить меня в родительский чат, я пришлю вам сюда карточку подключения."
+            )
+        else:
+            await message.answer("Здравствуйте! Я AI-администратор студии.")
+
+    @router.my_chat_member()
+    async def bot_added_or_removed(event: ChatMemberUpdated) -> None:
+        if event.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+            return
+        new_status = event.new_chat_member.status
+        if new_status not in {"member", "administrator"}:
+            return
+
+        chat_id = event.chat.id
+        title = event.chat.title or "Без названия"
+        status = chat_status_text(db.get_chat_type(chat_id))
+        text = (
+            "Бот добавлен в новый чат.\n\n"
+            f"Название: {title}\n"
+            f"Chat ID: {chat_id}\n"
+            f"Статус: {status}\n\n"
+            "Выберите режим работы для этого чата."
         )
+        await notify_admins(bot, config, text, reply_markup=chat_activation_keyboard(chat_id))
+
+    @router.message(F.new_chat_members)
+    async def delete_bot_added_service_message(message: Message) -> None:
+        if not message.new_chat_members:
+            return
+        if any(member.id == me.id for member in message.new_chat_members):
+            try:
+                await message.delete()
+            except TelegramBadRequest:
+                pass
 
     @router.message(Command("set_service_chat"))
     async def set_service_chat(message: Message) -> None:
@@ -478,6 +529,32 @@ async def main() -> None:
             return
         await message.answer("Рабочее время студии:\n" + db.get_working_hours_text())
 
+    @router.callback_query(F.data.startswith("chat:"))
+    async def chat_callback(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id, config):
+            await callback.answer("Недостаточно прав", show_alert=True)
+            return
+        _, action, raw_chat_id = callback.data.split(":")
+        chat_id = int(raw_chat_id)
+        try:
+            chat = await bot.get_chat(chat_id)
+            title = chat.title or "Без названия"
+        except Exception:
+            title = "Без названия"
+
+        if action == "parent":
+            db.add_chat(chat_id, "parent", title)
+            status = ACTIVE_PARENT_STATUS
+        elif action == "moderation":
+            db.add_chat(chat_id, "moderation", title)
+            status = MODERATION_ONLY_STATUS
+        else:
+            db.add_chat(chat_id, "ignored", title)
+            status = IGNORED_STATUS
+
+        await callback.message.edit_text(f"Чат: {title}\nChat ID: {chat_id}\nСтатус: {status}")
+        await callback.answer("Сохранено")
+
     @router.callback_query(F.data.startswith("kb:"))
     async def knowledge_callback(callback: CallbackQuery) -> None:
         if not is_admin(callback.from_user.id, config):
@@ -499,11 +576,18 @@ async def main() -> None:
             await callback.message.edit_text("❌ Материал не добавлен.")
             await callback.answer("Отклонено")
 
-    async def handle_service_message(message: Message) -> bool:
+    async def handle_knowledge_upload(message: Message) -> bool:
+        user_id = message.from_user.id if message.from_user else None
         service_chat_id = db.get_setting("service_chat_id", "")
-        is_service = db.get_chat_type(message.chat.id) == "service" or str(message.chat.id) == service_chat_id or message.chat.id == config.service_chat_id
-        if not is_service:
+        is_private_admin = message.chat.type == ChatType.PRIVATE and is_admin(user_id, config)
+        is_service = (
+            db.get_chat_type(message.chat.id) == "service"
+            or str(message.chat.id) == service_chat_id
+            or message.chat.id == config.service_chat_id
+        )
+        if not is_private_admin and not is_service:
             return False
+
         if message.text and not message.text.startswith("/"):
             raw_text = message.text
             title = raw_text[:80]
@@ -511,8 +595,10 @@ async def main() -> None:
             raw_text = await extract_pdf_text(bot, message.document.file_id)
             title = message.document.file_name or "PDF-документ"
         else:
-            await message.answer("Пока я могу добавлять в базу текстовые сообщения и PDF. Скрины/фото добавим следующим этапом через OCR.")
-            return True
+            if is_private_admin or is_service:
+                await message.answer("Пока я могу добавлять в базу текстовые сообщения и PDF. Скрины/фото добавим следующим этапом через OCR.")
+                return True
+            return False
 
         if not normalize_text(raw_text):
             await message.answer("Не удалось извлечь текст из материала.")
@@ -520,9 +606,8 @@ async def main() -> None:
 
         summary = await openai_service.summarize_knowledge(raw_text)
         item_id = db.add_pending_knowledge(title=title, content=summary, chat_id=message.chat.id, message_id=message.message_id)
-        preview = summary[:2500]
         await message.answer(
-            f"Я подготовил материал для базы знаний:\n\n{preview}\n\nДобавить это в базу?",
+            f"Я подготовил материал для базы знаний:\n\n{summary[:2500]}\n\nДобавить это в базу?",
             reply_markup=knowledge_keyboard(item_id),
         )
         return True
@@ -549,12 +634,15 @@ async def main() -> None:
 
     @router.message()
     async def all_messages(message: Message) -> None:
-        if await handle_service_message(message):
+        if await handle_knowledge_upload(message):
             return
 
         if message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
-            if await moderate_if_needed(message):
+            chat_type = db.get_chat_type(message.chat.id)
+            if chat_type in {"parent", "moderation"} and await moderate_if_needed(message):
                 return
+        else:
+            return
 
         chat_type = db.get_chat_type(message.chat.id)
         if chat_type != "parent":
