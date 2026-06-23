@@ -54,7 +54,7 @@ def utc_now() -> str:
 
 
 def parse_int_set(value: str | None) -> set[int]:
-    result = set()
+    result: set[int] = set()
     if not value:
         return result
     for item in value.split(","):
@@ -106,7 +106,7 @@ class Database:
         CREATE TABLE IF NOT EXISTS working_hours (weekday INTEGER PRIMARY KEY, start_time TEXT, end_time TEXT, enabled INTEGER NOT NULL DEFAULT 1);
         """)
         self.conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('bot_mode', ?)", (self.default_mode,))
-        defaults = {0:("16:00","22:00",1),1:("16:00","22:00",1),2:("16:00","22:00",1),3:("16:00","22:00",1),4:("16:00","22:00",1),5:("10:00","18:00",1),6:(None,None,0)}
+        defaults = {0: ("16:00", "22:00", 1), 1: ("16:00", "22:00", 1), 2: ("16:00", "22:00", 1), 3: ("16:00", "22:00", 1), 4: ("16:00", "22:00", 1), 5: ("10:00", "18:00", 1), 6: (None, None, 0)}
         for weekday, values in defaults.items():
             self.conn.execute("INSERT OR IGNORE INTO working_hours(weekday, start_time, end_time, enabled) VALUES(?, ?, ?, ?)", (weekday, *values))
         self.conn.commit()
@@ -127,15 +127,15 @@ class Database:
         row = self.conn.execute("SELECT type FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
         return row["type"] if row else None
 
-    def list_active_chats(self):
+    def list_active_chats(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM chats WHERE type IN ('parent', 'moderation') ORDER BY title").fetchall()
 
-    def add_pending_knowledge(self, title, content, chat_id, message_id) -> int:
+    def add_pending_knowledge(self, title: str, content: str, chat_id: int | None, message_id: int | None) -> int:
         cur = self.conn.execute("INSERT INTO pending_knowledge(title, content, source_chat_id, source_message_id, created_at) VALUES(?, ?, ?, ?, ?)", (title, content, chat_id, message_id, utc_now()))
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def get_pending_knowledge(self, item_id: int):
+    def get_pending_knowledge(self, item_id: int) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM pending_knowledge WHERE id = ?", (item_id,)).fetchone()
 
     def approve_knowledge(self, item_id: int, embedding: list[float] | None) -> bool:
@@ -151,31 +151,32 @@ class Database:
         self.conn.execute("DELETE FROM pending_knowledge WHERE id = ?", (item_id,))
         self.conn.commit()
 
-    def list_knowledge_with_embeddings(self):
+    def list_knowledge_with_embeddings(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM knowledge_items WHERE embedding IS NOT NULL ORDER BY id DESC").fetchall()
 
-    def list_recent_knowledge(self, limit: int = 8):
+    def list_recent_knowledge(self, limit: int = 8) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM knowledge_items ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
-    def save_question(self, chat_id, user_id, message_id, question, status) -> None:
+    def save_question(self, chat_id: int, user_id: int | None, message_id: int, question: str, status: str) -> None:
         self.conn.execute("INSERT INTO questions(chat_id, user_id, message_id, question, status, created_at) VALUES(?, ?, ?, ?, ?, ?)", (chat_id, user_id, message_id, question, status, utc_now()))
         self.conn.commit()
 
-    def save_moderation_log(self, chat_id, user_id, message_id, reason, text) -> None:
+    def save_moderation_log(self, chat_id: int, user_id: int | None, message_id: int, reason: str, text: str | None) -> None:
         self.conn.execute("INSERT INTO moderation_logs(chat_id, user_id, message_id, reason, text, created_at) VALUES(?, ?, ?, ?, ?, ?)", (chat_id, user_id, message_id, reason, text, utc_now()))
         self.conn.commit()
 
     def get_working_hours_text(self) -> str:
         names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
         rows = self.conn.execute("SELECT * FROM working_hours ORDER BY weekday").fetchall()
-        return "\n".join(f"{names[r['weekday']]}: {r['start_time']}-{r['end_time']}" if r["enabled"] else f"{names[r['weekday']]}: выходной" for r in rows)
+        return "\n".join(f"{names[row['weekday']]}: {row['start_time']}-{row['end_time']}" if row["enabled"] else f"{names[row['weekday']]}: выходной" for row in rows)
 
     def is_studio_open_now(self, tz_name: str) -> bool:
         now = datetime.now(ZoneInfo(tz_name))
         row = self.conn.execute("SELECT * FROM working_hours WHERE weekday = ?", (now.weekday(),)).fetchone()
         if not row or not row["enabled"] or not row["start_time"] or not row["end_time"]:
             return False
-        sh, sm = map(int, row["start_time"].split(":")); eh, em = map(int, row["end_time"].split(":"))
+        sh, sm = map(int, row["start_time"].split(":"))
+        eh, em = map(int, row["end_time"].split(":"))
         return time(sh, sm) <= now.time() <= time(eh, em)
 
 
@@ -190,7 +191,7 @@ class OpenAIService:
         weekdays = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
         return f"Сейчас: {now.strftime('%d.%m.%Y %H:%M')}, {weekdays[now.weekday()]}, часовой пояс {self.config.timezone}."
 
-    async def embedding(self, text: str):
+    async def embedding(self, text: str) -> list[float] | None:
         if not self.enabled or not self.client:
             return None
         response = await self.client.embeddings.create(model=self.config.embedding_model, input=text[:6000])
@@ -207,33 +208,23 @@ class OpenAIService:
         cleaned = normalize_text(text)
         if not self.enabled or not self.client:
             return cleaned[:3500]
-        system = f"Ты готовишь базу знаний только для студии {self.config.studio_name}. Алиасы: {self.config.studio_aliases}. Сохраняй только точные факты: даты, время, адреса, группы, форму, сборы, репетиции, оплату и правила. Не выдумывай."
-        response = await self.client.chat.completions.create(model=self.config.openai_model, messages=[{"role":"system","content":system},{"role":"user","content":cleaned[:12000]}], temperature=0.1)
+        system = f"Ты готовишь базу знаний только для студии {self.config.studio_name}. Сохраняй точные даты, время, адреса, группы, форму, оплату, правила. Не добавляй фактов."
+        response = await self.client.chat.completions.create(model=self.config.openai_model, messages=[{"role": "system", "content": system}, {"role": "user", "content": cleaned[:12000]}], temperature=0.1)
         return response.choices[0].message.content or cleaned[:3500]
 
     async def image_to_text(self, image_path: str) -> str:
         if not self.enabled or not self.client:
             return ""
         data = base64.b64encode(Path(image_path).read_bytes()).decode("utf-8")
-        response = await self.client.chat.completions.create(
-            model=self.config.openai_model,
-            messages=[{"role":"user","content":[{"type":"text","text":"Опиши изображение и извлеки видимый текст. Не связывай изображение с базой знаний, просто опиши то, что видно. Не додумывай."},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{data}"}}]}],
-            temperature=0.1,
-        )
+        response = await self.client.chat.completions.create(model=self.config.openai_model, messages=[{"role": "user", "content": [{"type": "text", "text": "Извлеки видимый текст с изображения для базы знаний. Не додумывай."}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}}]}], temperature=0.1)
         return response.choices[0].message.content or ""
 
     async def answer_from_context(self, question: str, context: str, chat_title: str | None) -> str:
         if not self.enabled or not self.client:
             return FALLBACK_TO_ADMIN
-        system = f"Ты отвечаешь от имени студии {self.config.studio_name}. {self.now_text()} Текущий чат: {chat_title or 'без названия'}. Отвечай только на поставленный вопрос. Не рассказывай всё, что знаешь. Используй контекст только для вопроса про занятия, расписание, сборы, форму, оплату, мероприятия или правила. Если точного ответа нет, ответь ровно: {FALLBACK_TO_ADMIN}"
-        response = await self.client.chat.completions.create(model=self.config.openai_model, messages=[{"role":"system","content":system},{"role":"user","content":f"КОНТЕКСТ:\n{context}\n\nВОПРОС:\n{question}"}], temperature=0.1)
-        return (response.choices[0].message.content or "").strip() or FALLBACK_TO_ADMIN
-
-    async def answer_direct(self, question: str) -> str:
-        if not self.enabled or not self.client:
-            return FALLBACK_TO_ADMIN
-        system = f"Ты спокойный администратор студии {self.config.studio_name}. Ответь кратко только на конкретный вопрос. Если вопрос про изображение, отвечай только по описанию изображения в сообщении. Не подтягивай базу знаний, расписания и старые события, если их прямо не спрашивают."
-        response = await self.client.chat.completions.create(model=self.config.openai_model, messages=[{"role":"system","content":system},{"role":"user","content":question}], temperature=0.2)
+        system = f"Ты отвечаешь от имени студии {self.config.studio_name}. {self.now_text()} Отвечай только на поставленный вопрос. Не рассказывай всё, что знаешь. Другие филиалы игнорируй. Если точного ответа нет, ответь ровно: {FALLBACK_TO_ADMIN}"
+        user = f"КОНТЕКСТ:\n{context}\n\nВОПРОС РОДИТЕЛЯ:\n{question}"
+        response = await self.client.chat.completions.create(model=self.config.openai_model, messages=[{"role": "system", "content": system}, {"role": "user", "content": user}], temperature=0.1)
         return (response.choices[0].message.content or "").strip() or FALLBACK_TO_ADMIN
 
 
@@ -261,14 +252,12 @@ def join_message_parts(parts: list[str]) -> str:
 
 def classify_message(text: str) -> str:
     lower = text.lower().strip()
-    if any(x in lower for x in ["[изображение", "фото", "картин", "на фото", "что это", "что на", "скрин"]):
-        return "image_question"
     if any(x in lower for x in ["жалоб", "не соглас", "разбер", "лично", "индивидуально", "возврат", "верните деньги"]):
         return "admin_required"
     studio_words = ["занят", "репетиц", "сбор", "форма", "оплат", "абонем", "распис", "концерт", "кубок", "турнир", "педагог", "студ", "админ", "даша", "дарья", "проспект", "зал", "адрес"]
     question_words = ["когда", "где", "куда", "во сколько", "сколько", "можно", "надо", "нужно", "какая", "какой", "какие", "что", "как", "почему"]
-    is_question = "?" in lower or any(lower.startswith(w) for w in question_words)
-    is_studio_related = any(w in lower for w in studio_words) or "у нас" in lower
+    is_question = "?" in lower or any(lower.startswith(word) for word in question_words)
+    is_studio_related = any(word in lower for word in studio_words) or "у нас" in lower
     if is_question and is_studio_related:
         return "studio_question"
     if any(x in lower for x in ["у кого", "кто может", "девочки", "родители", "кто едет", "кто забер"]):
@@ -289,11 +278,11 @@ def should_moderate(text: str, user_is_admin: bool) -> str | None:
 
 
 def knowledge_keyboard(item_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Добавить в базу", callback_data=f"kb:approve:{item_id}")],[InlineKeyboardButton(text="❌ Не добавлять", callback_data=f"kb:reject:{item_id}")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Добавить в базу", callback_data=f"kb:approve:{item_id}")], [InlineKeyboardButton(text="❌ Не добавлять", callback_data=f"kb:reject:{item_id}")]])
 
 
 def chat_control_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛡 Только модерация", callback_data=f"chat:moderation:{chat_id}")],[InlineKeyboardButton(text="⏸ Отключить чат", callback_data=f"chat:ignored:{chat_id}")],[InlineKeyboardButton(text="✅ Родительский чат", callback_data=f"chat:parent:{chat_id}")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛡 Только модерация", callback_data=f"chat:moderation:{chat_id}")], [InlineKeyboardButton(text="⏸ Отключить чат", callback_data=f"chat:ignored:{chat_id}")], [InlineKeyboardButton(text="✅ Родительский чат", callback_data=f"chat:parent:{chat_id}")]])
 
 
 async def download_to_temp(bot: Bot, file_id: str, suffix: str) -> str:
@@ -313,7 +302,7 @@ async def extract_pdf_text(bot: Bot, file_id: str) -> str:
         Path(temp_path).unlink(missing_ok=True)
 
 
-def find_relevant_context(db: Database, query_embedding, limit: int = 6) -> str:
+def find_relevant_context(db: Database, query_embedding: list[float] | None, limit: int = 6) -> str:
     recent = list(db.list_recent_knowledge(4))
     if not query_embedding:
         return "\n\n".join(row["content"] for row in recent)
@@ -328,7 +317,8 @@ def find_relevant_context(db: Database, query_embedding, limit: int = 6) -> str:
             logger.warning("Bad embedding for item %s: %s", row["id"], exc)
     scored.sort(reverse=True, key=lambda item: item[0])
     selected = [row for score, row in scored[:limit] if score >= 0.15]
-    merged, seen = [], set()
+    merged = []
+    seen = set()
     for row in selected + recent:
         if row["id"] not in seen:
             seen.add(row["id"])
@@ -343,7 +333,11 @@ def bot_is_active(db: Database, config: Config) -> bool:
     if mode == "off":
         return False
     studio_open = db.is_studio_open_now(config.timezone)
-    return (mode == "outside_working_hours" and not studio_open) or (mode == "working_hours_only" and studio_open)
+    if mode == "outside_working_hours":
+        return not studio_open
+    if mode == "working_hours_only":
+        return studio_open
+    return True
 
 
 async def notify_admins(bot: Bot, config: Config, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
@@ -440,12 +434,8 @@ async def main() -> None:
             title = chat.title or "Без названия"
         except Exception:
             title = "Без названия"
-        if action == "parent":
-            chat_type, status = "parent", ACTIVE_PARENT_STATUS
-        elif action == "moderation":
-            chat_type, status = "moderation", MODERATION_ONLY_STATUS
-        else:
-            chat_type, status = "ignored", IGNORED_STATUS
+        chat_type = "parent" if action == "parent" else "moderation" if action == "moderation" else "ignored"
+        status = ACTIVE_PARENT_STATUS if chat_type == "parent" else MODERATION_ONLY_STATUS if chat_type == "moderation" else IGNORED_STATUS
         db.add_chat(chat_id, chat_type, title)
         await callback.message.edit_text(f"Чат: {title}\nChat ID: {chat_id}\nСтатус: {status}")
         await callback.answer("Сохранено")
@@ -477,22 +467,26 @@ async def main() -> None:
         is_service = db.get_chat_type(message.chat.id) == "service" or str(message.chat.id) == service_chat_id or message.chat.id == config.service_chat_id
         if not is_private_admin and not is_service:
             return False
-        raw_text, title = "", "Материал"
+        raw_text = ""
+        title = "Материал"
         if message.text and not message.text.startswith("/"):
-            raw_text, title = message.text, message.text[:80]
+            raw_text = message.text
+            title = raw_text[:80]
         elif message.document and message.document.mime_type == "application/pdf":
             raw_text = await extract_pdf_text(bot, message.document.file_id)
             title = message.document.file_name or "PDF-документ"
         elif message.photo:
             path = await download_to_temp(bot, message.photo[-1].file_id, ".jpg")
             try:
-                raw_text, title = await ai.image_to_text(path), "Скриншот/фото"
+                raw_text = await ai.image_to_text(path)
+                title = "Скриншот/фото"
             finally:
                 Path(path).unlink(missing_ok=True)
         elif message.voice:
             path = await download_to_temp(bot, message.voice.file_id, ".ogg")
             try:
-                raw_text, title = await ai.transcribe_audio(path), "Голосовое сообщение"
+                raw_text = await ai.transcribe_audio(path)
+                title = "Голосовое сообщение"
             finally:
                 Path(path).unlink(missing_ok=True)
         else:
@@ -521,19 +515,13 @@ async def main() -> None:
         return True
 
     async def extract_parent_message_text(message: Message) -> str:
-        parts = []
+        parts: list[str] = []
         if message.text:
             parts.append(message.text)
         if message.caption:
             parts.append(message.caption)
-        if message.photo:
-            path = await download_to_temp(bot, message.photo[-1].file_id, ".jpg")
-            try:
-                image_text = await ai.image_to_text(path)
-                if image_text:
-                    parts.append(f"[Изображение: {image_text}]")
-            finally:
-                Path(path).unlink(missing_ok=True)
+        # Фото в родительских чатах намеренно не анализируем.
+        # Фото и скриншоты используются только в личке админа или сервисном чате для базы знаний.
         if message.voice:
             path = await download_to_temp(bot, message.voice.file_id, ".ogg")
             try:
@@ -548,13 +536,8 @@ async def main() -> None:
         if not text or text.startswith("/") or not bot_is_active(db, config):
             return
         kind = classify_message(text)
-        logger.info("Message classified kind=%s chat=%s text=%s", kind, message.chat.id, text[:120])
+        logger.info("Message kind=%s chat=%s text=%s", kind, message.chat.id, text[:120])
         if kind == "ignore":
-            return
-        if kind == "image_question":
-            answer = await ai.answer_direct(text)
-            db.save_question(message.chat.id, message.from_user.id if message.from_user else None, message.message_id, text, "answered_image")
-            await message.reply(answer)
             return
         if kind == "admin_required":
             db.save_question(message.chat.id, message.from_user.id if message.from_user else None, message.message_id, text, "waiting_admin")
@@ -580,8 +563,8 @@ async def main() -> None:
         entry = message_buffers.pop(key, None)
         if not entry:
             return
-        text = join_message_parts(entry["parts"])  # type: ignore[arg-type]
-        message = entry["message"]  # type: ignore[assignment]
+        text = join_message_parts(entry["parts"])
+        message = entry["message"]
         await process_parent_message(message, text)
 
     @router.message()
@@ -606,8 +589,8 @@ async def main() -> None:
         key = (message.chat.id, user_id)
         old = message_buffers.get(key)
         if old and old.get("task"):
-            old["task"].cancel()  # type: ignore[union-attr]
-        parts = list(old["parts"]) if old else []  # type: ignore[index]
+            old["task"].cancel()
+        parts = list(old["parts"]) if old else []
         parts.append(text)
         task = asyncio.create_task(flush_message_buffer(key))
         message_buffers[key] = {"parts": parts, "message": message, "task": task}
