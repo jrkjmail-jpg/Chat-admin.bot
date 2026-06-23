@@ -54,7 +54,7 @@ def utc_now() -> str:
 
 
 def parse_int_set(value: str | None) -> set[int]:
-    result: set[int] = set()
+    result = set()
     if not value:
         return result
     for item in value.split(","):
@@ -96,17 +96,15 @@ class Database:
         logger.info("Database connected: %s", self.path)
 
     def init_schema(self) -> None:
-        self.conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY, type TEXT NOT NULL, title TEXT, created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS knowledge_items (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT NOT NULL, source_chat_id INTEGER, source_message_id INTEGER, embedding TEXT, created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS pending_knowledge (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT NOT NULL, source_chat_id INTEGER, source_message_id INTEGER, created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS questions (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, user_id INTEGER, message_id INTEGER, question TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS moderation_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, user_id INTEGER, message_id INTEGER, reason TEXT NOT NULL, text TEXT, created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS working_hours (weekday INTEGER PRIMARY KEY, start_time TEXT, end_time TEXT, enabled INTEGER NOT NULL DEFAULT 1);
-            """
-        )
+        self.conn.executescript("""
+        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY, type TEXT NOT NULL, title TEXT, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS knowledge_items (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT NOT NULL, source_chat_id INTEGER, source_message_id INTEGER, embedding TEXT, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS pending_knowledge (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT NOT NULL, source_chat_id INTEGER, source_message_id INTEGER, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS questions (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, user_id INTEGER, message_id INTEGER, question TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS moderation_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, user_id INTEGER, message_id INTEGER, reason TEXT NOT NULL, text TEXT, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS working_hours (weekday INTEGER PRIMARY KEY, start_time TEXT, end_time TEXT, enabled INTEGER NOT NULL DEFAULT 1);
+        """)
         self.conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('bot_mode', ?)", (self.default_mode,))
         defaults = {0:("16:00","22:00",1),1:("16:00","22:00",1),2:("16:00","22:00",1),3:("16:00","22:00",1),4:("16:00","22:00",1),5:("10:00","18:00",1),6:(None,None,0)}
         for weekday, values in defaults.items():
@@ -129,15 +127,15 @@ class Database:
         row = self.conn.execute("SELECT type FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
         return row["type"] if row else None
 
-    def list_active_chats(self) -> list[sqlite3.Row]:
+    def list_active_chats(self):
         return self.conn.execute("SELECT * FROM chats WHERE type IN ('parent', 'moderation') ORDER BY title").fetchall()
 
-    def add_pending_knowledge(self, title: str, content: str, chat_id: int | None, message_id: int | None) -> int:
+    def add_pending_knowledge(self, title, content, chat_id, message_id) -> int:
         cur = self.conn.execute("INSERT INTO pending_knowledge(title, content, source_chat_id, source_message_id, created_at) VALUES(?, ?, ?, ?, ?)", (title, content, chat_id, message_id, utc_now()))
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def get_pending_knowledge(self, item_id: int) -> sqlite3.Row | None:
+    def get_pending_knowledge(self, item_id: int):
         return self.conn.execute("SELECT * FROM pending_knowledge WHERE id = ?", (item_id,)).fetchone()
 
     def approve_knowledge(self, item_id: int, embedding: list[float] | None) -> bool:
@@ -153,17 +151,17 @@ class Database:
         self.conn.execute("DELETE FROM pending_knowledge WHERE id = ?", (item_id,))
         self.conn.commit()
 
-    def list_knowledge_with_embeddings(self) -> list[sqlite3.Row]:
+    def list_knowledge_with_embeddings(self):
         return self.conn.execute("SELECT * FROM knowledge_items WHERE embedding IS NOT NULL ORDER BY id DESC").fetchall()
 
-    def list_recent_knowledge(self, limit: int = 8) -> list[sqlite3.Row]:
+    def list_recent_knowledge(self, limit: int = 8):
         return self.conn.execute("SELECT * FROM knowledge_items ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
-    def save_question(self, chat_id: int, user_id: int | None, message_id: int, question: str, status: str) -> None:
+    def save_question(self, chat_id, user_id, message_id, question, status) -> None:
         self.conn.execute("INSERT INTO questions(chat_id, user_id, message_id, question, status, created_at) VALUES(?, ?, ?, ?, ?, ?)", (chat_id, user_id, message_id, question, status, utc_now()))
         self.conn.commit()
 
-    def save_moderation_log(self, chat_id: int, user_id: int | None, message_id: int, reason: str, text: str | None) -> None:
+    def save_moderation_log(self, chat_id, user_id, message_id, reason, text) -> None:
         self.conn.execute("INSERT INTO moderation_logs(chat_id, user_id, message_id, reason, text, created_at) VALUES(?, ?, ?, ?, ?, ?)", (chat_id, user_id, message_id, reason, text, utc_now()))
         self.conn.commit()
 
@@ -192,7 +190,7 @@ class OpenAIService:
         weekdays = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
         return f"Сейчас: {now.strftime('%d.%m.%Y %H:%M')}, {weekdays[now.weekday()]}, часовой пояс {self.config.timezone}."
 
-    async def embedding(self, text: str) -> list[float] | None:
+    async def embedding(self, text: str):
         if not self.enabled or not self.client:
             return None
         response = await self.client.embeddings.create(model=self.config.embedding_model, input=text[:6000])
@@ -202,25 +200,15 @@ class OpenAIService:
         if not self.enabled or not self.client:
             return ""
         with open(audio_path, "rb") as audio_file:
-            response = await self.client.audio.transcriptions.create(
-                model=self.config.transcription_model,
-                file=audio_file,
-                language="ru",
-            )
+            response = await self.client.audio.transcriptions.create(model=self.config.transcription_model, file=audio_file, language="ru")
         return getattr(response, "text", "") or ""
 
     async def summarize_knowledge(self, text: str) -> str:
         cleaned = normalize_text(text)
         if not self.enabled or not self.client:
             return cleaned[:3500]
-        prompt = (
-            f"Ты готовишь базу знаний только для студии {self.config.studio_name}. "
-            f"Алиасы нужной студии: {self.config.studio_aliases}. {self.now_text()} "
-            "Извлекай только факты, которые относятся к этой студии или к Рязанскому проспекту. "
-            "Другие филиалы, студии и площадки игнорируй. Сохраняй даты, время, год, день недели, адреса, группы, форму, сборы, репетиции, оплату и правила. "
-            "Если год в документе не указан, не выдумывай его. Не добавляй фактов, которых нет."
-        )
-        response = await self.client.chat.completions.create(model=self.config.openai_model, messages=[{"role":"system","content":prompt},{"role":"user","content":cleaned[:12000]}], temperature=0.1)
+        system = f"Ты готовишь базу знаний только для студии {self.config.studio_name}. Алиасы: {self.config.studio_aliases}. Сохраняй только точные факты: даты, время, адреса, группы, форму, сборы, репетиции, оплату и правила. Не выдумывай."
+        response = await self.client.chat.completions.create(model=self.config.openai_model, messages=[{"role":"system","content":system},{"role":"user","content":cleaned[:12000]}], temperature=0.1)
         return response.choices[0].message.content or cleaned[:3500]
 
     async def image_to_text(self, image_path: str) -> str:
@@ -229,30 +217,26 @@ class OpenAIService:
         data = base64.b64encode(Path(image_path).read_bytes()).decode("utf-8")
         response = await self.client.chat.completions.create(
             model=self.config.openai_model,
-            messages=[{"role":"user","content":[{"type":"text","text":"Опиши изображение и извлеки весь полезный текст. Если это скрин, расписание, афиша, форма, адрес или объявление для студии — сохрани даты, время, группы, адреса, правила. Не додумывай."},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{data}"}}]}],
+            messages=[{"role":"user","content":[{"type":"text","text":"Опиши изображение и извлеки видимый текст. Не связывай изображение с базой знаний, просто опиши то, что видно. Не додумывай."},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{data}"}}]}],
             temperature=0.1,
         )
         return response.choices[0].message.content or ""
 
-    async def answer(self, question: str, context: str, chat_title: str | None) -> str:
+    async def answer_from_context(self, question: str, context: str, chat_title: str | None) -> str:
         if not self.enabled or not self.client:
             return FALLBACK_TO_ADMIN
-        system = (
-            f"Ты отвечаешь от имени студии {self.config.studio_name}. Алиасы: {self.config.studio_aliases}. "
-            f"Администраторы: {self.config.admin_names}. Текущий чат/группа: {chat_title or 'без названия'}. {self.now_text()} "
-            "Сообщение родителя могло быть собрано из текста, голосового сообщения, картинки или нескольких коротких сообщений подряд. Отвечай на общий смысл. "
-            "Отвечай только по этой студии. Другие студии, филиалы и площадки полностью игнорируй, даже если они есть в контексте. "
-            "Никогда не предлагай выбрать другую студию. Если вопрос про дату без года, используй текущий год только как ориентир, но не утверждай его, если в базе нет года. "
-            "Если в базе несколько групп нужной студии, выбери по названию текущего чата. "
-            "Сначала максимально попробуй ответить сам по базе. Передавай администратору только если данных по нужной студии нет, они противоречивы или нужен личный ответ. "
-            f"Если точного ответа нет, ответь ровно: {FALLBACK_TO_ADMIN}"
-        )
-        user = f"КОНТЕКСТ:\n{context}\n\nВОПРОС РОДИТЕЛЯ:\n{question}"
-        response = await self.client.chat.completions.create(model=self.config.openai_model, messages=[{"role":"system","content":system},{"role":"user","content":user}], temperature=0.1)
+        system = f"Ты отвечаешь от имени студии {self.config.studio_name}. {self.now_text()} Текущий чат: {chat_title or 'без названия'}. Отвечай только на поставленный вопрос. Не рассказывай всё, что знаешь. Используй контекст только для вопроса про занятия, расписание, сборы, форму, оплату, мероприятия или правила. Если точного ответа нет, ответь ровно: {FALLBACK_TO_ADMIN}"
+        response = await self.client.chat.completions.create(model=self.config.openai_model, messages=[{"role":"system","content":system},{"role":"user","content":f"КОНТЕКСТ:\n{context}\n\nВОПРОС:\n{question}"}], temperature=0.1)
+        return (response.choices[0].message.content or "").strip() or FALLBACK_TO_ADMIN
+
+    async def answer_direct(self, question: str) -> str:
+        if not self.enabled or not self.client:
+            return FALLBACK_TO_ADMIN
+        system = f"Ты спокойный администратор студии {self.config.studio_name}. Ответь кратко только на конкретный вопрос. Если вопрос про изображение, отвечай только по описанию изображения в сообщении. Не подтягивай базу знаний, расписания и старые события, если их прямо не спрашивают."
+        response = await self.client.chat.completions.create(model=self.config.openai_model, messages=[{"role":"system","content":system},{"role":"user","content":question}], temperature=0.2)
         return (response.choices[0].message.content or "").strip() or FALLBACK_TO_ADMIN
 
 
-BAD_WORDS = {"дурак", "идиот", "тупой", "тупая", "дебил", "лох"}
 AD_PATTERNS = [re.compile(r"https?://", re.I), re.compile(r"t\.me/", re.I), re.compile(r"@\w{4,}", re.I), re.compile(r"скидк[аи]|акци[яи]|купите|заработок|подработка", re.I)]
 
 
@@ -275,21 +259,33 @@ def join_message_parts(parts: list[str]) -> str:
     return normalize_text(result)
 
 
+def classify_message(text: str) -> str:
+    lower = text.lower().strip()
+    if any(x in lower for x in ["[изображение", "фото", "картин", "на фото", "что это", "что на", "скрин"]):
+        return "image_question"
+    if any(x in lower for x in ["жалоб", "не соглас", "разбер", "лично", "индивидуально", "возврат", "верните деньги"]):
+        return "admin_required"
+    studio_words = ["занят", "репетиц", "сбор", "форма", "оплат", "абонем", "распис", "концерт", "кубок", "турнир", "педагог", "студ", "админ", "даша", "дарья", "проспект", "зал", "адрес"]
+    question_words = ["когда", "где", "куда", "во сколько", "сколько", "можно", "надо", "нужно", "какая", "какой", "какие", "что", "как", "почему"]
+    is_question = "?" in lower or any(lower.startswith(w) for w in question_words)
+    is_studio_related = any(w in lower for w in studio_words) or "у нас" in lower
+    if is_question and is_studio_related:
+        return "studio_question"
+    if any(x in lower for x in ["у кого", "кто может", "девочки", "родители", "кто едет", "кто забер"]):
+        return "ignore"
+    if is_question:
+        return "admin_required"
+    return "ignore"
+
+
 def is_admin(user_id: int | None, config: Config) -> bool:
     return bool(user_id and user_id in config.admin_ids)
 
 
 def should_moderate(text: str, user_is_admin: bool) -> str | None:
-    lower = text.lower()
-    if any(word in lower for word in BAD_WORDS): return "оскорбление"
-    if not user_is_admin and any(pattern.search(text) for pattern in AD_PATTERNS): return "возможная реклама или ссылка"
+    if not user_is_admin and any(pattern.search(text) for pattern in AD_PATTERNS):
+        return "возможная реклама или ссылка"
     return None
-
-
-def is_likely_question(text: str) -> bool:
-    lower = text.lower().strip()
-    words = ("когда", "где", "куда", "во сколько", "сколько", "можно", "надо", "нужно", "какая", "какой", "какие", "что", "как", "почему", "даша", "дарья")
-    return "?" in lower or lower.startswith(words)
 
 
 def knowledge_keyboard(item_id: int) -> InlineKeyboardMarkup:
@@ -317,7 +313,7 @@ async def extract_pdf_text(bot: Bot, file_id: str) -> str:
         Path(temp_path).unlink(missing_ok=True)
 
 
-def find_relevant_context(db: Database, query_embedding: list[float] | None, limit: int = 6) -> str:
+def find_relevant_context(db: Database, query_embedding, limit: int = 6) -> str:
     recent = list(db.list_recent_knowledge(4))
     if not query_embedding:
         return "\n\n".join(row["content"] for row in recent)
@@ -332,26 +328,30 @@ def find_relevant_context(db: Database, query_embedding: list[float] | None, lim
             logger.warning("Bad embedding for item %s: %s", row["id"], exc)
     scored.sort(reverse=True, key=lambda item: item[0])
     selected = [row for score, row in scored[:limit] if score >= 0.15]
-    merged = []
-    seen = set()
+    merged, seen = [], set()
     for row in selected + recent:
         if row["id"] not in seen:
-            seen.add(row["id"]); merged.append(row["content"])
+            seen.add(row["id"])
+            merged.append(row["content"])
     return "\n\n".join(merged)
 
 
 def bot_is_active(db: Database, config: Config) -> bool:
     mode = db.get_setting("bot_mode", config.default_mode)
-    if mode == "always": return True
-    if mode == "off": return False
+    if mode == "always":
+        return True
+    if mode == "off":
+        return False
     studio_open = db.is_studio_open_now(config.timezone)
     return (mode == "outside_working_hours" and not studio_open) or (mode == "working_hours_only" and studio_open)
 
 
 async def notify_admins(bot: Bot, config: Config, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
     for admin_id in config.admin_ids:
-        try: await bot.send_message(admin_id, text, reply_markup=reply_markup)
-        except Exception as exc: logger.warning("Cannot notify admin %s: %s", admin_id, exc)
+        try:
+            await bot.send_message(admin_id, text, reply_markup=reply_markup)
+        except Exception as exc:
+            logger.warning("Cannot notify admin %s: %s", admin_id, exc)
 
 
 async def send_startup_report(bot: Bot, db: Database, config: Config) -> None:
@@ -367,8 +367,13 @@ async def send_startup_report(bot: Bot, db: Database, config: Config) -> None:
 
 
 async def main() -> None:
-    config = load_config(); db = Database(config.database_path, config.default_mode); ai = OpenAIService(config)
-    bot = Bot(config.bot_token); me = await bot.get_me(); dp = Dispatcher(); router = Router()
+    config = load_config()
+    db = Database(config.database_path, config.default_mode)
+    ai = OpenAIService(config)
+    bot = Bot(config.bot_token)
+    me = await bot.get_me()
+    dp = Dispatcher()
+    router = Router()
     message_buffers: dict[tuple[int, int], dict[str, object]] = {}
 
     @router.message(Command("start"))
@@ -377,8 +382,10 @@ async def main() -> None:
 
     @router.my_chat_member()
     async def bot_added(event: ChatMemberUpdated) -> None:
-        if event.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}: return
-        if event.new_chat_member.status not in {"member", "administrator"}: return
+        if event.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+            return
+        if event.new_chat_member.status not in {"member", "administrator"}:
+            return
         db.add_chat(event.chat.id, "parent", event.chat.title or "Без названия")
         await notify_admins(bot, config, f"Чат автоматически активирован.\n\nНазвание: {event.chat.title or 'Без названия'}\nChat ID: {event.chat.id}\nСтатус: {ACTIVE_PARENT_STATUS}", chat_control_keyboard(event.chat.id))
 
@@ -386,86 +393,135 @@ async def main() -> None:
     async def delete_join_message(message: Message) -> None:
         if message.new_chat_members and any(member.id == me.id for member in message.new_chat_members):
             db.add_chat(message.chat.id, "parent", message.chat.title)
-            try: await message.delete()
-            except TelegramBadRequest: pass
+            try:
+                await message.delete()
+            except TelegramBadRequest:
+                pass
 
     @router.message(Command("set_service_chat"))
     async def set_service_chat(message: Message) -> None:
         if is_admin(message.from_user.id if message.from_user else None, config):
-            db.add_chat(message.chat.id, "service", message.chat.title); db.set_setting("service_chat_id", str(message.chat.id)); await message.answer("Этот чат назначен сервисным чатом базы знаний.")
+            db.add_chat(message.chat.id, "service", message.chat.title)
+            db.set_setting("service_chat_id", str(message.chat.id))
+            await message.answer("Этот чат назначен сервисным чатом базы знаний.")
 
     @router.message(Command("add_parent_chat"))
     async def add_parent_chat(message: Message) -> None:
-        if is_admin(message.from_user.id if message.from_user else None, config): db.add_chat(message.chat.id, "parent", message.chat.title); await message.answer("Этот чат назначен родительским чатом студии.")
+        if is_admin(message.from_user.id if message.from_user else None, config):
+            db.add_chat(message.chat.id, "parent", message.chat.title)
+            await message.answer("Этот чат назначен родительским чатом студии.")
 
     @router.message(Command("mode"))
     async def set_mode(message: Message) -> None:
-        if not is_admin(message.from_user.id if message.from_user else None, config): return
-        parts = (message.text or "").split(maxsplit=1); allowed = {"always", "outside_working_hours", "working_hours_only", "off"}
-        if len(parts) != 2 or parts[1] not in allowed: await message.answer("Используйте: /mode always|outside_working_hours|working_hours_only|off"); return
-        db.set_setting("bot_mode", parts[1]); await message.answer(f"Режим работы бота изменён: {parts[1]}")
+        if not is_admin(message.from_user.id if message.from_user else None, config):
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        allowed = {"always", "outside_working_hours", "working_hours_only", "off"}
+        if len(parts) != 2 or parts[1] not in allowed:
+            await message.answer("Используйте: /mode always|outside_working_hours|working_hours_only|off")
+            return
+        db.set_setting("bot_mode", parts[1])
+        await message.answer(f"Режим работы бота изменён: {parts[1]}")
 
     @router.message(Command("hours"))
     async def hours(message: Message) -> None:
-        if is_admin(message.from_user.id if message.from_user else None, config): await message.answer("Рабочее время студии:\n" + db.get_working_hours_text())
+        if is_admin(message.from_user.id if message.from_user else None, config):
+            await message.answer("Рабочее время студии:\n" + db.get_working_hours_text())
 
     @router.callback_query(F.data.startswith("chat:"))
     async def chat_callback(callback: CallbackQuery) -> None:
-        if not is_admin(callback.from_user.id, config): await callback.answer("Недостаточно прав", show_alert=True); return
-        _, action, raw_chat_id = callback.data.split(":"); chat_id = int(raw_chat_id)
-        try: chat = await bot.get_chat(chat_id); title = chat.title or "Без названия"
-        except Exception: title = "Без названия"
-        chat_type = "parent" if action == "parent" else "moderation" if action == "moderation" else "ignored"
-        status = ACTIVE_PARENT_STATUS if chat_type == "parent" else MODERATION_ONLY_STATUS if chat_type == "moderation" else IGNORED_STATUS
-        db.add_chat(chat_id, chat_type, title); await callback.message.edit_text(f"Чат: {title}\nChat ID: {chat_id}\nСтатус: {status}"); await callback.answer("Сохранено")
+        if not is_admin(callback.from_user.id, config):
+            await callback.answer("Недостаточно прав", show_alert=True)
+            return
+        _, action, raw_chat_id = callback.data.split(":")
+        chat_id = int(raw_chat_id)
+        try:
+            chat = await bot.get_chat(chat_id)
+            title = chat.title or "Без названия"
+        except Exception:
+            title = "Без названия"
+        if action == "parent":
+            chat_type, status = "parent", ACTIVE_PARENT_STATUS
+        elif action == "moderation":
+            chat_type, status = "moderation", MODERATION_ONLY_STATUS
+        else:
+            chat_type, status = "ignored", IGNORED_STATUS
+        db.add_chat(chat_id, chat_type, title)
+        await callback.message.edit_text(f"Чат: {title}\nChat ID: {chat_id}\nСтатус: {status}")
+        await callback.answer("Сохранено")
 
     @router.callback_query(F.data.startswith("kb:"))
     async def knowledge_callback(callback: CallbackQuery) -> None:
-        if not is_admin(callback.from_user.id, config): await callback.answer("Недостаточно прав", show_alert=True); return
-        _, action, raw_id = callback.data.split(":"); item_id = int(raw_id)
+        if not is_admin(callback.from_user.id, config):
+            await callback.answer("Недостаточно прав", show_alert=True)
+            return
+        _, action, raw_id = callback.data.split(":")
+        item_id = int(raw_id)
         if action == "approve":
             row = db.get_pending_knowledge(item_id)
-            if not row: await callback.answer("Материал уже обработан", show_alert=True); return
-            db.approve_knowledge(item_id, await ai.embedding(row["content"])); await callback.message.edit_text("✅ Материал добавлен в базу знаний."); await callback.answer("Добавлено")
+            if not row:
+                await callback.answer("Материал уже обработан", show_alert=True)
+                return
+            db.approve_knowledge(item_id, await ai.embedding(row["content"]))
+            await callback.message.edit_text("✅ Материал добавлен в базу знаний.")
+            await callback.answer("Добавлено")
         else:
-            db.reject_knowledge(item_id); await callback.message.edit_text("❌ Материал не добавлен."); await callback.answer("Отклонено")
+            db.reject_knowledge(item_id)
+            await callback.message.edit_text("❌ Материал не добавлен.")
+            await callback.answer("Отклонено")
 
     async def handle_knowledge_upload(message: Message) -> bool:
         user_id = message.from_user.id if message.from_user else None
         service_chat_id = db.get_setting("service_chat_id", "")
         is_private_admin = message.chat.type == ChatType.PRIVATE and is_admin(user_id, config)
         is_service = db.get_chat_type(message.chat.id) == "service" or str(message.chat.id) == service_chat_id or message.chat.id == config.service_chat_id
-        if not is_private_admin and not is_service: return False
-        raw_text = ""; title = "Материал"
-        if message.text and not message.text.startswith("/"): raw_text = message.text; title = raw_text[:80]
-        elif message.document and message.document.mime_type == "application/pdf": raw_text = await extract_pdf_text(bot, message.document.file_id); title = message.document.file_name or "PDF-документ"
+        if not is_private_admin and not is_service:
+            return False
+        raw_text, title = "", "Материал"
+        if message.text and not message.text.startswith("/"):
+            raw_text, title = message.text, message.text[:80]
+        elif message.document and message.document.mime_type == "application/pdf":
+            raw_text = await extract_pdf_text(bot, message.document.file_id)
+            title = message.document.file_name or "PDF-документ"
         elif message.photo:
             path = await download_to_temp(bot, message.photo[-1].file_id, ".jpg")
-            try: raw_text = await ai.image_to_text(path); title = "Скриншот/фото"
-            finally: Path(path).unlink(missing_ok=True)
+            try:
+                raw_text, title = await ai.image_to_text(path), "Скриншот/фото"
+            finally:
+                Path(path).unlink(missing_ok=True)
         elif message.voice:
             path = await download_to_temp(bot, message.voice.file_id, ".ogg")
-            try: raw_text = await ai.transcribe_audio(path); title = "Голосовое сообщение"
-            finally: Path(path).unlink(missing_ok=True)
-        else: await message.answer("Пока я могу добавлять в базу текст, PDF, изображения и голосовые сообщения."); return True
-        if not normalize_text(raw_text): await message.answer("Не удалось извлечь текст из материала."); return True
+            try:
+                raw_text, title = await ai.transcribe_audio(path), "Голосовое сообщение"
+            finally:
+                Path(path).unlink(missing_ok=True)
+        else:
+            await message.answer("Пока я могу добавлять в базу текст, PDF, изображения и голосовые сообщения.")
+            return True
+        if not normalize_text(raw_text):
+            await message.answer("Не удалось извлечь текст из материала.")
+            return True
         summary = await ai.summarize_knowledge(raw_text)
         item_id = db.add_pending_knowledge(title, summary, message.chat.id, message.message_id)
         await message.answer(f"Я подготовил материал для базы знаний:\n\n{summary[:2500]}\n\nДобавить это в базу?", reply_markup=knowledge_keyboard(item_id))
         return True
 
     async def moderate_if_needed(message: Message) -> bool:
-        text = message.text or message.caption or ""; user_id = message.from_user.id if message.from_user else None
+        text = message.text or message.caption or ""
+        user_id = message.from_user.id if message.from_user else None
         reason = should_moderate(text, is_admin(user_id, config)) if text else None
-        if not reason: return False
+        if not reason:
+            return False
         db.save_moderation_log(message.chat.id, user_id, message.message_id, reason, text)
-        try: await message.delete()
-        except TelegramBadRequest: pass
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            pass
         await notify_admins(bot, config, f"Модерация: {reason}\nЧат: {message.chat.title or message.chat.id}\nТекст: {text[:500]}")
         return True
 
     async def extract_parent_message_text(message: Message) -> str:
-        parts: list[str] = []
+        parts = []
         if message.text:
             parts.append(message.text)
         if message.caption:
@@ -488,17 +544,35 @@ async def main() -> None:
                 Path(path).unlink(missing_ok=True)
         return join_message_parts(parts)
 
-    async def process_parent_question(message: Message, text: str) -> None:
-        if not text or text.startswith("/") or not is_likely_question(text) or not bot_is_active(db, config):
+    async def process_parent_message(message: Message, text: str) -> None:
+        if not text or text.startswith("/") or not bot_is_active(db, config):
+            return
+        kind = classify_message(text)
+        logger.info("Message classified kind=%s chat=%s text=%s", kind, message.chat.id, text[:120])
+        if kind == "ignore":
+            return
+        if kind == "image_question":
+            answer = await ai.answer_direct(text)
+            db.save_question(message.chat.id, message.from_user.id if message.from_user else None, message.message_id, text, "answered_image")
+            await message.reply(answer)
+            return
+        if kind == "admin_required":
+            db.save_question(message.chat.id, message.from_user.id if message.from_user else None, message.message_id, text, "waiting_admin")
+            await message.reply(FALLBACK_TO_ADMIN)
+            await notify_admins(bot, config, f"Вопрос/ситуация для администратора:\n{text}\n\nЧат: {message.chat.title or message.chat.id}")
             return
         search_text = f"{config.studio_name}\n{config.studio_aliases}\n{message.chat.title or ''}\n{text}\n{ai.now_text()}"
         context = find_relevant_context(db, await ai.embedding(search_text))
         if not context:
-            db.save_question(message.chat.id, message.from_user.id if message.from_user else None, message.message_id, text, "sent_to_admin")
-            await message.reply(FALLBACK_TO_ADMIN); await notify_admins(bot, config, f"Вопрос родителя:\n{text}\n\nЧат: {message.chat.title or message.chat.id}"); return
-        answer = await ai.answer(text, context, message.chat.title)
-        db.save_question(message.chat.id, message.from_user.id if message.from_user else None, message.message_id, text, "sent_to_admin" if answer == FALLBACK_TO_ADMIN else "answered")
-        if answer == FALLBACK_TO_ADMIN: await notify_admins(bot, config, f"Вопрос родителя:\n{text}\n\nЧат: {message.chat.title or message.chat.id}")
+            db.save_question(message.chat.id, message.from_user.id if message.from_user else None, message.message_id, text, "waiting_admin")
+            await message.reply(FALLBACK_TO_ADMIN)
+            await notify_admins(bot, config, f"Вопрос родителя:\n{text}\n\nЧат: {message.chat.title or message.chat.id}")
+            return
+        answer = await ai.answer_from_context(text, context, message.chat.title)
+        status = "waiting_admin" if answer == FALLBACK_TO_ADMIN else "answered"
+        db.save_question(message.chat.id, message.from_user.id if message.from_user else None, message.message_id, text, status)
+        if answer == FALLBACK_TO_ADMIN:
+            await notify_admins(bot, config, f"Вопрос родителя:\n{text}\n\nЧат: {message.chat.title or message.chat.id}")
         await message.reply(answer)
 
     async def flush_message_buffer(key: tuple[int, int]) -> None:
@@ -508,23 +582,26 @@ async def main() -> None:
             return
         text = join_message_parts(entry["parts"])  # type: ignore[arg-type]
         message = entry["message"]  # type: ignore[assignment]
-        logger.info("Buffered message chat=%s user=%s text=%s", key[0], key[1], text[:120])
-        await process_parent_question(message, text)
+        await process_parent_message(message, text)
 
     @router.message()
     async def all_messages(message: Message) -> None:
-        if await handle_knowledge_upload(message): return
-        if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}: return
+        if await handle_knowledge_upload(message):
+            return
+        if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+            return
         chat_type = db.get_chat_type(message.chat.id)
         if chat_type is None:
-            db.add_chat(message.chat.id, "parent", message.chat.title); chat_type = "parent"
+            db.add_chat(message.chat.id, "parent", message.chat.title)
+            chat_type = "parent"
             await notify_admins(bot, config, f"Чат автоматически активирован по первому сообщению.\n\nНазвание: {message.chat.title or 'Без названия'}\nChat ID: {message.chat.id}\nСтатус: {ACTIVE_PARENT_STATUS}", chat_control_keyboard(message.chat.id))
-        if chat_type in {"parent", "moderation"} and await moderate_if_needed(message): return
-        if chat_type != "parent": return
-
+        if chat_type in {"parent", "moderation"} and await moderate_if_needed(message):
+            return
+        if chat_type != "parent":
+            return
         text = await extract_parent_message_text(message)
-        if not text or text.startswith("/"): return
-
+        if not text or text.startswith("/"):
+            return
         user_id = message.from_user.id if message.from_user else 0
         key = (message.chat.id, user_id)
         old = message_buffers.get(key)
@@ -535,7 +612,9 @@ async def main() -> None:
         task = asyncio.create_task(flush_message_buffer(key))
         message_buffers[key] = {"parts": parts, "message": message, "task": task}
 
-    dp.include_router(router); await send_startup_report(bot, db, config); await dp.start_polling(bot)
+    dp.include_router(router)
+    await send_startup_report(bot, db, config)
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
