@@ -41,6 +41,7 @@ class Config:
     database_path: str
     openai_model: str
     embedding_model: str
+    transcription_model: str
     default_mode: str
     timezone: str
     studio_name: str
@@ -75,6 +76,7 @@ def load_config() -> Config:
         database_path=os.getenv("DATABASE_PATH", "/app/data/studio_admin.db"),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
         embedding_model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
+        transcription_model=os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe"),
         default_mode=os.getenv("BOT_DEFAULT_MODE", "outside_working_hours"),
         timezone=os.getenv("STUDIO_TIMEZONE", "Europe/Moscow"),
         studio_name=os.getenv("STUDIO_NAME", "Тодес Рязанский проспект").strip() or "Тодес Рязанский проспект",
@@ -196,6 +198,17 @@ class OpenAIService:
         response = await self.client.embeddings.create(model=self.config.embedding_model, input=text[:6000])
         return response.data[0].embedding
 
+    async def transcribe_audio(self, audio_path: str) -> str:
+        if not self.enabled or not self.client:
+            return ""
+        with open(audio_path, "rb") as audio_file:
+            response = await self.client.audio.transcriptions.create(
+                model=self.config.transcription_model,
+                file=audio_file,
+                language="ru",
+            )
+        return getattr(response, "text", "") or ""
+
     async def summarize_knowledge(self, text: str) -> str:
         cleaned = normalize_text(text)
         if not self.enabled or not self.client:
@@ -216,7 +229,7 @@ class OpenAIService:
         data = base64.b64encode(Path(image_path).read_bytes()).decode("utf-8")
         response = await self.client.chat.completions.create(
             model=self.config.openai_model,
-            messages=[{"role":"user","content":[{"type":"text","text":"Извлеки весь полезный текст с изображения для базы знаний студии. Сохрани даты, время, группы, адреса, правила. Не додумывай."},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{data}"}}]}],
+            messages=[{"role":"user","content":[{"type":"text","text":"Опиши изображение и извлеки весь полезный текст. Если это скрин, расписание, афиша, форма, адрес или объявление для студии — сохрани даты, время, группы, адреса, правила. Не додумывай."},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{data}"}}]}],
             temperature=0.1,
         )
         return response.choices[0].message.content or ""
@@ -227,7 +240,7 @@ class OpenAIService:
         system = (
             f"Ты отвечаешь от имени студии {self.config.studio_name}. Алиасы: {self.config.studio_aliases}. "
             f"Администраторы: {self.config.admin_names}. Текущий чат/группа: {chat_title or 'без названия'}. {self.now_text()} "
-            "Сообщение родителя могло быть собрано из нескольких коротких сообщений подряд. Отвечай на общий смысл, а не на отдельные обрывки. "
+            "Сообщение родителя могло быть собрано из текста, голосового сообщения, картинки или нескольких коротких сообщений подряд. Отвечай на общий смысл. "
             "Отвечай только по этой студии. Другие студии, филиалы и площадки полностью игнорируй, даже если они есть в контексте. "
             "Никогда не предлагай выбрать другую студию. Если вопрос про дату без года, используй текущий год только как ориентир, но не утверждай его, если в базе нет года. "
             "Если в базе несколько групп нужной студии, выбери по названию текущего чата. "
@@ -430,7 +443,11 @@ async def main() -> None:
             path = await download_to_temp(bot, message.photo[-1].file_id, ".jpg")
             try: raw_text = await ai.image_to_text(path); title = "Скриншот/фото"
             finally: Path(path).unlink(missing_ok=True)
-        else: await message.answer("Пока я могу добавлять в базу текст, PDF и изображения."); return True
+        elif message.voice:
+            path = await download_to_temp(bot, message.voice.file_id, ".ogg")
+            try: raw_text = await ai.transcribe_audio(path); title = "Голосовое сообщение"
+            finally: Path(path).unlink(missing_ok=True)
+        else: await message.answer("Пока я могу добавлять в базу текст, PDF, изображения и голосовые сообщения."); return True
         if not normalize_text(raw_text): await message.answer("Не удалось извлечь текст из материала."); return True
         summary = await ai.summarize_knowledge(raw_text)
         item_id = db.add_pending_knowledge(title, summary, message.chat.id, message.message_id)
@@ -446,6 +463,30 @@ async def main() -> None:
         except TelegramBadRequest: pass
         await notify_admins(bot, config, f"Модерация: {reason}\nЧат: {message.chat.title or message.chat.id}\nТекст: {text[:500]}")
         return True
+
+    async def extract_parent_message_text(message: Message) -> str:
+        parts: list[str] = []
+        if message.text:
+            parts.append(message.text)
+        if message.caption:
+            parts.append(message.caption)
+        if message.photo:
+            path = await download_to_temp(bot, message.photo[-1].file_id, ".jpg")
+            try:
+                image_text = await ai.image_to_text(path)
+                if image_text:
+                    parts.append(f"[Изображение: {image_text}]")
+            finally:
+                Path(path).unlink(missing_ok=True)
+        if message.voice:
+            path = await download_to_temp(bot, message.voice.file_id, ".ogg")
+            try:
+                voice_text = await ai.transcribe_audio(path)
+                if voice_text:
+                    parts.append(f"[Голосовое сообщение: {voice_text}]")
+            finally:
+                Path(path).unlink(missing_ok=True)
+        return join_message_parts(parts)
 
     async def process_parent_question(message: Message, text: str) -> None:
         if not text or text.startswith("/") or not is_likely_question(text) or not bot_is_active(db, config):
@@ -480,7 +521,8 @@ async def main() -> None:
             await notify_admins(bot, config, f"Чат автоматически активирован по первому сообщению.\n\nНазвание: {message.chat.title or 'Без названия'}\nChat ID: {message.chat.id}\nСтатус: {ACTIVE_PARENT_STATUS}", chat_control_keyboard(message.chat.id))
         if chat_type in {"parent", "moderation"} and await moderate_if_needed(message): return
         if chat_type != "parent": return
-        text = message.text or message.caption or ""
+
+        text = await extract_parent_message_text(message)
         if not text or text.startswith("/"): return
 
         user_id = message.from_user.id if message.from_user else 0
