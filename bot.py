@@ -113,13 +113,16 @@ class Database:
     def init_schema(self) -> None:
         self.conn.executescript("""
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY, type TEXT NOT NULL, title TEXT, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY, type TEXT NOT NULL, title TEXT, respond_to_all INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS knowledge_items (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT NOT NULL, source_chat_id INTEGER, source_message_id INTEGER, embedding TEXT, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS pending_knowledge (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT NOT NULL, source_chat_id INTEGER, source_message_id INTEGER, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS questions (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, user_id INTEGER, message_id INTEGER, question TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS moderation_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, user_id INTEGER, message_id INTEGER, reason TEXT NOT NULL, text TEXT, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS working_hours (weekday INTEGER PRIMARY KEY, start_time TEXT, end_time TEXT, enabled INTEGER NOT NULL DEFAULT 1);
         """)
+        chat_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(chats)").fetchall()}
+        if "respond_to_all" not in chat_columns:
+            self.conn.execute("ALTER TABLE chats ADD COLUMN respond_to_all INTEGER NOT NULL DEFAULT 0")
         self.conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('bot_mode', ?)", (self.default_mode,))
         defaults = {0: ("16:00", "22:00", 1), 1: ("16:00", "22:00", 1), 2: ("16:00", "22:00", 1), 3: ("16:00", "22:00", 1), 4: ("16:00", "22:00", 1), 5: ("10:00", "18:00", 1), 6: (None, None, 0)}
         for weekday, values in defaults.items():
@@ -141,6 +144,17 @@ class Database:
     def get_chat_type(self, chat_id: int) -> str | None:
         row = self.conn.execute("SELECT type FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
         return row["type"] if row else None
+
+    def responds_to_all_messages(self, chat_id: int) -> bool:
+        row = self.conn.execute("SELECT respond_to_all FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
+        return bool(row and row["respond_to_all"])
+
+    def set_respond_to_all_messages(self, chat_id: int, enabled: bool) -> None:
+        self.conn.execute(
+            "UPDATE chats SET respond_to_all = ? WHERE chat_id = ?",
+            (int(enabled), chat_id),
+        )
+        self.conn.commit()
 
     def list_active_chats(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM chats WHERE type IN ('parent', 'moderation') ORDER BY title").fetchall()
@@ -248,12 +262,36 @@ class OpenAIService:
         response = await self.client.chat.completions.create(model=self.config.openai_model, messages=[{"role": "user", "content": [{"type": "text", "text": "Извлеки видимый текст с изображения для базы знаний. Не додумывай."}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}}]}], temperature=0.1)
         return response.choices[0].message.content or ""
 
-    async def answer_from_context(self, question: str, context: str, chat_title: str | None) -> str:
+    async def answer_from_context(
+        self,
+        question: str,
+        context: str,
+        chat_title: str | None,
+        conversational: bool = False,
+    ) -> str:
         if not self.enabled or not self.client:
             return FALLBACK_TO_ADMIN
-        system = f"Ты отвечаешь от имени студии {self.config.studio_name}. {self.now_text()} Отвечай только на поставленный вопрос. Не рассказывай всё, что знаешь. Другие филиалы игнорируй. Если точного ответа нет, ответь ровно: {FALLBACK_TO_ADMIN}"
-        user = f"КОНТЕКСТ:\n{context}\n\nВОПРОС РОДИТЕЛЯ:\n{question}"
-        response = await self.client.chat.completions.create(model=self.config.openai_model, messages=[{"role": "system", "content": system}, {"role": "user", "content": user}], temperature=0.1)
+        if conversational:
+            behavior = (
+                "Кратко и естественно реагируй на каждое сообщение. "
+                "На приветствие, благодарность или обычную реплику отвечай уместно и без выдуманных фактов. "
+                f"Если пользователь просит факт о студии, которого нет в контексте, ответь ровно: {FALLBACK_TO_ADMIN}"
+            )
+        else:
+            behavior = (
+                "Отвечай только на поставленный вопрос. Не рассказывай всё, что знаешь. "
+                f"Если точного ответа нет, ответь ровно: {FALLBACK_TO_ADMIN}"
+            )
+        system = (
+            f"Ты отвечаешь от имени студии {self.config.studio_name}. {self.now_text()} "
+            f"{behavior} Другие филиалы игнорируй."
+        )
+        user = f"КОНТЕКСТ:\n{context or '(нет сохранённого контекста)'}\n\nСООБЩЕНИЕ РОДИТЕЛЯ:\n{question}"
+        response = await self.client.chat.completions.create(
+            model=self.config.openai_model,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=0.1,
+        )
         return (response.choices[0].message.content or "").strip() or FALLBACK_TO_ADMIN
 
 
@@ -364,7 +402,12 @@ def knowledge_keyboard(item_id: int) -> InlineKeyboardMarkup:
 
 
 def chat_control_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛡 Только модерация", callback_data=f"chat:moderation:{chat_id}")], [InlineKeyboardButton(text="⏸ Отключить чат", callback_data=f"chat:ignored:{chat_id}")], [InlineKeyboardButton(text="✅ Родительский чат", callback_data=f"chat:parent:{chat_id}")]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛡 Только модерация", callback_data=f"chat:moderation:{chat_id}")],
+        [InlineKeyboardButton(text="⏸ Отключить чат", callback_data=f"chat:ignored:{chat_id}")],
+        [InlineKeyboardButton(text="✅ Родительский чат", callback_data=f"chat:parent:{chat_id}")],
+        [InlineKeyboardButton(text="💬 Ответы на каждое сообщение", callback_data=f"chat_all:toggle:{chat_id}")],
+    ])
 
 
 async def download_to_temp(bot: Bot, file_id: str, suffix: str) -> str:
@@ -523,17 +566,22 @@ def bot_is_active(db: Database, config: Config) -> bool:
     return True
 
 
-def mode_menu_keyboard(current_mode: str) -> InlineKeyboardMarkup:
+def mode_menu_keyboard(db: Database, current_mode: str, chat_id: int | None = None) -> InlineKeyboardMarkup:
     def mode_button(mode: str, label: str) -> InlineKeyboardButton:
         prefix = "✅ " if current_mode == mode else ""
         return InlineKeyboardButton(text=prefix + label, callback_data=f"mode:{mode}")
 
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [mode_button("always", "🟢 Включить сейчас")],
         [mode_button("outside_working_hours", "🕒 Включаться после смены")],
         [mode_button("off", "🔴 Выключить сейчас")],
         [InlineKeyboardButton(text="⚙️ Настроить график администратора", callback_data="menu:hours")],
-    ])
+    ]
+    if chat_id is not None:
+        enabled = db.responds_to_all_messages(chat_id)
+        label = "✅ Отвечать на каждое сообщение" if enabled else "💬 Отвечать на каждое сообщение"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"chat_all:toggle:{chat_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def working_hours_keyboard(db: Database) -> InlineKeyboardMarkup:
@@ -572,16 +620,21 @@ def parse_working_hours(value: str) -> tuple[str | None, str | None, bool] | Non
     return start_value.strftime("%H:%M"), end_value.strftime("%H:%M"), True
 
 
-def mode_menu_text(db: Database, config: Config) -> str:
+def mode_menu_text(db: Database, config: Config, chat_id: int | None = None) -> str:
     current_mode = db.get_setting("bot_mode", config.default_mode)
     current_label = MODE_LABELS.get(current_mode, current_mode)
     admin_status = "на рабочем месте" if db.is_admin_working_now(config.timezone) else "не на рабочем месте"
     reply_status = "отвечает родителям" if bot_is_active(db, config) else "не отвечает родителям"
+    chat_setting = ""
+    if chat_id is not None:
+        all_status = "включены" if db.responds_to_all_messages(chat_id) else "выключены"
+        chat_setting = f"\nОтветы на каждое сообщение в этом чате: {all_status}."
     return (
         "⚙️ Меню AI-администратора\n\n"
         f"Режим: {current_label}\n"
         f"По графику администратор сейчас: {admin_status}.\n"
-        f"Бот сейчас: {reply_status}.\n\n"
+        f"Бот сейчас: {reply_status}."
+        f"{chat_setting}\n\n"
         "Можно включить или выключить бота вручную либо выбрать автоматическую работу после смены."
     )
 
