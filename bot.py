@@ -674,14 +674,18 @@ async def main() -> None:
     router = Router()
     message_buffers: dict[tuple[int, int], dict[str, object]] = {}
 
+    def menu_parent_chat_id(chat_id: int) -> int | None:
+        return chat_id if db.get_chat_type(chat_id) == "parent" else None
+
     @router.message(Command("start"))
     async def start(message: Message) -> None:
         user_id = message.from_user.id if message.from_user else None
         if is_admin(user_id, config):
             current_mode = db.get_setting("bot_mode", config.default_mode)
+            menu_chat_id = menu_parent_chat_id(message.chat.id)
             await message.answer(
-                mode_menu_text(db, config),
-                reply_markup=mode_menu_keyboard(current_mode),
+                mode_menu_text(db, config, menu_chat_id),
+                reply_markup=mode_menu_keyboard(db, current_mode, menu_chat_id),
             )
             return
         await message.answer(f"Здравствуйте! Я AI-администратор студии {config.studio_name}.")
@@ -693,9 +697,10 @@ async def main() -> None:
             await message.answer("Меню управления доступно только администраторам.")
             return
         current_mode = db.get_setting("bot_mode", config.default_mode)
+        menu_chat_id = menu_parent_chat_id(message.chat.id)
         await message.answer(
-            mode_menu_text(db, config),
-            reply_markup=mode_menu_keyboard(current_mode),
+            mode_menu_text(db, config, menu_chat_id),
+            reply_markup=mode_menu_keyboard(db, current_mode, menu_chat_id),
         )
 
     @router.my_chat_member()
@@ -736,18 +741,20 @@ async def main() -> None:
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) == 1:
             current_mode = db.get_setting("bot_mode", config.default_mode)
+            menu_chat_id = menu_parent_chat_id(message.chat.id)
             await message.answer(
-                mode_menu_text(db, config),
-                reply_markup=mode_menu_keyboard(current_mode),
+                mode_menu_text(db, config, menu_chat_id),
+                reply_markup=mode_menu_keyboard(db, current_mode, menu_chat_id),
             )
             return
         if parts[1] not in MODE_LABELS:
             await message.answer("Неизвестный режим. Откройте /menu и выберите режим кнопкой.")
             return
         db.set_setting("bot_mode", parts[1])
+        menu_chat_id = menu_parent_chat_id(message.chat.id)
         await message.answer(
-            mode_menu_text(db, config),
-            reply_markup=mode_menu_keyboard(parts[1]),
+            mode_menu_text(db, config, menu_chat_id),
+            reply_markup=mode_menu_keyboard(db, parts[1], menu_chat_id),
         )
 
     @router.message(Command("hours"))
@@ -799,9 +806,10 @@ async def main() -> None:
             await callback.answer("Этот режим уже включён")
             return
         db.set_setting("bot_mode", selected_mode)
+        menu_chat_id = menu_parent_chat_id(callback.message.chat.id)
         await callback.message.edit_text(
-            mode_menu_text(db, config),
-            reply_markup=mode_menu_keyboard(selected_mode),
+            mode_menu_text(db, config, menu_chat_id),
+            reply_markup=mode_menu_keyboard(db, selected_mode, menu_chat_id),
         )
         await callback.answer("Режим изменён")
 
@@ -822,9 +830,10 @@ async def main() -> None:
             await callback.answer("Недостаточно прав", show_alert=True)
             return
         current_mode = db.get_setting("bot_mode", config.default_mode)
+        menu_chat_id = menu_parent_chat_id(callback.message.chat.id)
         await callback.message.edit_text(
-            mode_menu_text(db, config),
-            reply_markup=mode_menu_keyboard(current_mode),
+            mode_menu_text(db, config, menu_chat_id),
+            reply_markup=mode_menu_keyboard(db, current_mode, menu_chat_id),
         )
         await callback.answer()
 
@@ -852,6 +861,48 @@ async def main() -> None:
             ),
         )
         await callback.answer()
+
+    @router.callback_query(F.data.startswith("chat_all:toggle:"))
+    async def toggle_respond_to_all(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id, config):
+            await callback.answer("Недостаточно прав", show_alert=True)
+            return
+        try:
+            chat_id = int(callback.data.rsplit(":", maxsplit=1)[1])
+        except (TypeError, ValueError):
+            await callback.answer("Некорректный чат", show_alert=True)
+            return
+        if db.get_chat_type(chat_id) != "parent":
+            await callback.answer(
+                "Сначала включите для этого чата режим «Родительский чат».",
+                show_alert=True,
+            )
+            return
+
+        enabled = not db.responds_to_all_messages(chat_id)
+        db.set_respond_to_all_messages(chat_id, enabled)
+        state_text = "включены" if enabled else "выключены"
+
+        if callback.message.chat.id == chat_id:
+            current_mode = db.get_setting("bot_mode", config.default_mode)
+            await callback.message.edit_text(
+                mode_menu_text(db, config, chat_id),
+                reply_markup=mode_menu_keyboard(db, current_mode, chat_id),
+            )
+        else:
+            try:
+                chat = await bot.get_chat(chat_id)
+                title = chat.title or "Без названия"
+            except Exception:
+                title = "Без названия"
+            await callback.message.edit_text(
+                f"Чат: {title}\n"
+                f"Chat ID: {chat_id}\n"
+                f"Статус: {ACTIVE_PARENT_STATUS}\n"
+                f"Ответы на каждое сообщение: {state_text}.",
+                reply_markup=chat_control_keyboard(chat_id),
+            )
+        await callback.answer(f"Ответы на каждое сообщение {state_text}")
 
     @router.callback_query(F.data.startswith("chat:"))
     async def chat_callback(callback: CallbackQuery) -> None:
@@ -992,23 +1043,40 @@ async def main() -> None:
     async def process_parent_message(message: Message, text: str) -> None:
         if not text or text.startswith("/") or not bot_is_active(db, config):
             return
+        respond_to_all = db.responds_to_all_messages(message.chat.id)
         kind = classify_message(text)
-        logger.info("Message kind=%s chat=%s text=%s", kind, message.chat.id, text[:120])
-        if kind == "ignore":
+        logger.info(
+            "Message kind=%s respond_to_all=%s chat=%s text=%s",
+            kind,
+            respond_to_all,
+            message.chat.id,
+            text[:120],
+        )
+        if kind == "ignore" and not respond_to_all:
             return
         if kind == "admin_required":
             db.save_question(message.chat.id, message.from_user.id if message.from_user else None, message.message_id, text, "waiting_admin")
             await message.reply(FALLBACK_TO_ADMIN)
             await notify_admins(bot, config, f"Вопрос/ситуация для администратора:\n{text}\n\nЧат: {message.chat.title or message.chat.id}")
             return
-        search_text = f"{config.studio_name}\n{config.studio_aliases}\n{message.chat.title or ''}\n{text}\n{ai.now_text()}"
-        context = find_relevant_context(db, await ai.embedding(search_text))
-        if not context:
-            db.save_question(message.chat.id, message.from_user.id if message.from_user else None, message.message_id, text, "waiting_admin")
-            await message.reply(FALLBACK_TO_ADMIN)
-            await notify_admins(bot, config, f"Вопрос родителя:\n{text}\n\nЧат: {message.chat.title or message.chat.id}")
-            return
-        answer = await ai.answer_from_context(text, context, message.chat.title)
+
+        conversational = respond_to_all and kind == "ignore"
+        context = ""
+        if not conversational:
+            search_text = f"{config.studio_name}\n{config.studio_aliases}\n{message.chat.title or ''}\n{text}\n{ai.now_text()}"
+            context = find_relevant_context(db, await ai.embedding(search_text))
+            if not context:
+                db.save_question(message.chat.id, message.from_user.id if message.from_user else None, message.message_id, text, "waiting_admin")
+                await message.reply(FALLBACK_TO_ADMIN)
+                await notify_admins(bot, config, f"Вопрос родителя:\n{text}\n\nЧат: {message.chat.title or message.chat.id}")
+                return
+
+        answer = await ai.answer_from_context(
+            text,
+            context,
+            message.chat.title,
+            conversational=conversational,
+        )
         status = "waiting_admin" if answer == FALLBACK_TO_ADMIN else "answered"
         db.save_question(message.chat.id, message.from_user.id if message.from_user else None, message.message_id, text, status)
         if answer == FALLBACK_TO_ADMIN:
@@ -1041,6 +1109,9 @@ async def main() -> None:
             return
         text = await extract_parent_message_text(message)
         if not text or text.startswith("/"):
+            return
+        if db.responds_to_all_messages(message.chat.id):
+            await process_parent_message(message, text)
             return
         user_id = message.from_user.id if message.from_user else 0
         key = (message.chat.id, user_id)
