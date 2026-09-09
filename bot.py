@@ -310,6 +310,13 @@ def classify_message(text: str) -> str:
         "что", "как", "почему", "кто", "есть ли", "имеется ли", "к кому",
         "на когда",
     ]
+    interrogative_words = {
+        "когда", "где", "куда", "откуда", "сколько", "что", "чего", "зачем",
+        "почему", "как", "какой", "какая", "какое", "какие", "каким",
+        "какими", "каком", "чей", "чья", "чьё", "чьи", "кто", "кому", "кого",
+    }
+    leading_words = re.findall(r"[а-яё]+", lower)[:5]
+
     request_patterns = [
         r"\bподскаж(?:и|ите)\b",
         r"\bскаж(?:и|ите)\b",
@@ -330,6 +337,7 @@ def classify_message(text: str) -> str:
     is_request = (
         "?" in lower
         or any(lower.startswith(word) for word in question_starts)
+        or any(word in interrogative_words for word in leading_words)
         or any(re.search(pattern, lower) for pattern in request_patterns)
     )
     is_studio_related = any(word in lower for word in studio_words) or "у нас" in lower
