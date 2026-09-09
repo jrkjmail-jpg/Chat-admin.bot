@@ -16,7 +16,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import BotCommand, CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BotCommand, CallbackQuery, ChatMemberUpdated, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from pypdf import PdfReader
@@ -31,11 +31,13 @@ MODERATION_ONLY_STATUS = "🛡 Активен только как модерат
 IGNORED_STATUS = "⏸ Не подключён"
 MESSAGE_BUFFER_SECONDS = float(os.getenv("MESSAGE_BUFFER_SECONDS", "4"))
 MODE_LABELS = {
-    "always": "🟢 Всегда включён",
-    "outside_working_hours": "🌙 Только вне рабочего времени",
-    "working_hours_only": "☀️ Только в рабочее время",
-    "off": "🔴 Ответы выключены",
+    "always": "🟢 Включён вручную",
+    "outside_working_hours": "🕒 Автоматически после смены администратора",
+    "working_hours_only": "☀️ Только во время смены администратора",
+    "off": "🔴 Выключен вручную",
 }
+WEEKDAY_LABELS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+HOURS_PROMPT_PREFIX = "Настройка графика администратора — "
 
 
 @dataclass(frozen=True)
@@ -171,19 +173,33 @@ class Database:
         self.conn.execute("INSERT INTO moderation_logs(chat_id, user_id, message_id, reason, text, created_at) VALUES(?, ?, ?, ?, ?, ?)", (chat_id, user_id, message_id, reason, text, utc_now()))
         self.conn.commit()
 
-    def get_working_hours_text(self) -> str:
-        names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-        rows = self.conn.execute("SELECT * FROM working_hours ORDER BY weekday").fetchall()
-        return "\n".join(f"{names[row['weekday']]}: {row['start_time']}-{row['end_time']}" if row["enabled"] else f"{names[row['weekday']]}: выходной" for row in rows)
+    def list_working_hours(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM working_hours ORDER BY weekday").fetchall()
 
-    def is_studio_open_now(self, tz_name: str) -> bool:
+    def get_working_hours_text(self) -> str:
+        rows = self.list_working_hours()
+        return "\n".join(
+            f"{WEEKDAY_LABELS[row['weekday']]}: {row['start_time']}-{row['end_time']}"
+            if row["enabled"]
+            else f"{WEEKDAY_LABELS[row['weekday']]}: выходной"
+            for row in rows
+        )
+
+    def set_working_hours(self, weekday: int, start_time: str | None, end_time: str | None, enabled: bool) -> None:
+        self.conn.execute(
+            "UPDATE working_hours SET start_time = ?, end_time = ?, enabled = ? WHERE weekday = ?",
+            (start_time, end_time, int(enabled), weekday),
+        )
+        self.conn.commit()
+
+    def is_admin_working_now(self, tz_name: str) -> bool:
         now = datetime.now(ZoneInfo(tz_name))
         row = self.conn.execute("SELECT * FROM working_hours WHERE weekday = ?", (now.weekday(),)).fetchone()
         if not row or not row["enabled"] or not row["start_time"] or not row["end_time"]:
             return False
         sh, sm = map(int, row["start_time"].split(":"))
         eh, em = map(int, row["end_time"].split(":"))
-        return time(sh, sm) <= now.time() <= time(eh, em)
+        return time(sh, sm) <= now.time() < time(eh, em)
 
 
 class OpenAIService:
@@ -338,11 +354,11 @@ def bot_is_active(db: Database, config: Config) -> bool:
         return True
     if mode == "off":
         return False
-    studio_open = db.is_studio_open_now(config.timezone)
+    admin_working = db.is_admin_working_now(config.timezone)
     if mode == "outside_working_hours":
-        return not studio_open
+        return not admin_working
     if mode == "working_hours_only":
-        return studio_open
+        return admin_working
     return True
 
 
@@ -352,27 +368,60 @@ def mode_menu_keyboard(current_mode: str) -> InlineKeyboardMarkup:
         return InlineKeyboardButton(text=prefix + label, callback_data=f"mode:{mode}")
 
     return InlineKeyboardMarkup(inline_keyboard=[
-        [mode_button("always", "Всегда")],
-        [mode_button("outside_working_hours", "Вне рабочего времени")],
-        [mode_button("working_hours_only", "В рабочее время")],
-        [mode_button("off", "Выключить ответы")],
-        [InlineKeyboardButton(text="🕒 Показать рабочее время", callback_data="menu:hours")],
+        [mode_button("always", "🟢 Включить сейчас")],
+        [mode_button("outside_working_hours", "🕒 Включаться после смены")],
+        [mode_button("off", "🔴 Выключить сейчас")],
+        [InlineKeyboardButton(text="⚙️ Настроить график администратора", callback_data="menu:hours")],
     ])
+
+
+def working_hours_keyboard(db: Database) -> InlineKeyboardMarkup:
+    rows = []
+    for row in db.list_working_hours():
+        day = WEEKDAY_LABELS[row["weekday"]]
+        hours = f"{row['start_time']}-{row['end_time']}" if row["enabled"] else "выходной"
+        rows.append([InlineKeyboardButton(text=f"{day}: {hours}", callback_data=f"hours:edit:{row['weekday']}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def working_hours_menu_text(db: Database) -> str:
+    return (
+        "⚙️ Рабочее время живого администратора\n\n"
+        + db.get_working_hours_text()
+        + "\n\nВ автоматическом режиме бот молчит во время смены "
+        "и включается сразу после её окончания. Нажмите на день, чтобы изменить время."
+    )
+
+
+def parse_working_hours(value: str) -> tuple[str | None, str | None, bool] | None:
+    cleaned = value.strip().lower().replace("—", "-").replace("–", "-")
+    if cleaned in {"выходной", "нет", "off"}:
+        return None, None, False
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})", cleaned)
+    if not match:
+        return None
+    sh, sm, eh, em = map(int, match.groups())
+    if sh > 23 or eh > 23 or sm > 59 or em > 59:
+        return None
+    start_value = time(sh, sm)
+    end_value = time(eh, em)
+    if start_value >= end_value:
+        return None
+    return start_value.strftime("%H:%M"), end_value.strftime("%H:%M"), True
 
 
 def mode_menu_text(db: Database, config: Config) -> str:
     current_mode = db.get_setting("bot_mode", config.default_mode)
     current_label = MODE_LABELS.get(current_mode, current_mode)
-    reply_status = "отвечает родителям" if bot_is_active(db, config) else "сейчас не отвечает родителям"
+    admin_status = "на рабочем месте" if db.is_admin_working_now(config.timezone) else "не на рабочем месте"
+    reply_status = "отвечает родителям" if bot_is_active(db, config) else "не отвечает родителям"
     return (
         "⚙️ Меню AI-администратора\n\n"
-        f"Текущий режим: {current_label}\n"
-        f"Статус сейчас: {reply_status}.\n\n"
-        "Выберите режим кнопкой ниже.\n\n"
-        "Другие команды:\n"
-        "/hours — показать рабочее время\n"
-        "/set_service_chat — назначить сервисный чат\n"
-        "/add_parent_chat — назначить родительский чат"
+        f"Режим: {current_label}\n"
+        f"По графику администратор сейчас: {admin_status}.\n"
+        f"Бот сейчас: {reply_status}.\n\n"
+        "Можно включить или выключить бота вручную либо выбрать автоматическую работу после смены."
     )
 
 
@@ -405,7 +454,7 @@ async def main() -> None:
     await bot.set_my_commands([
         BotCommand(command="start", description="Запустить бота"),
         BotCommand(command="menu", description="Открыть меню администратора"),
-        BotCommand(command="hours", description="Показать рабочее время"),
+        BotCommand(command="hours", description="Настроить график администратора"),
     ])
     dp = Dispatcher()
     router = Router()
@@ -489,8 +538,38 @@ async def main() -> None:
 
     @router.message(Command("hours"))
     async def hours(message: Message) -> None:
-        if is_admin(message.from_user.id if message.from_user else None, config):
-            await message.answer("Рабочее время студии:\n" + db.get_working_hours_text())
+        if not is_admin(message.from_user.id if message.from_user else None, config):
+            return
+        await message.answer(
+            working_hours_menu_text(db),
+            reply_markup=working_hours_keyboard(db),
+        )
+
+    @router.message(F.reply_to_message.text.startswith(HOURS_PROMPT_PREFIX))
+    async def save_working_hours(message: Message) -> None:
+        if not is_admin(message.from_user.id if message.from_user else None, config):
+            return
+        prompt_text = message.reply_to_message.text or ""
+        first_line = prompt_text.splitlines()[0]
+        day_name = first_line.removeprefix(HOURS_PROMPT_PREFIX).strip()
+        if day_name not in WEEKDAY_LABELS:
+            await message.answer("Не удалось определить день недели. Откройте /hours и попробуйте снова.")
+            return
+        parsed = parse_working_hours(message.text or "")
+        if parsed is None:
+            await message.answer(
+                "Неверный формат. Ответьте временем, например 09:00-18:00, "
+                "или словом «выходной»."
+            )
+            return
+        start_time, end_time, enabled = parsed
+        weekday = WEEKDAY_LABELS.index(day_name)
+        db.set_working_hours(weekday, start_time, end_time, enabled)
+        saved_value = f"{start_time}-{end_time}" if enabled else "выходной"
+        await message.answer(
+            f"✅ {day_name}: {saved_value}\n\n" + working_hours_menu_text(db),
+            reply_markup=working_hours_keyboard(db),
+        )
 
     @router.callback_query(F.data.startswith("mode:"))
     async def mode_callback(callback: CallbackQuery) -> None:
@@ -517,7 +596,47 @@ async def main() -> None:
         if not is_admin(callback.from_user.id, config):
             await callback.answer("Недостаточно прав", show_alert=True)
             return
-        await callback.message.answer("Рабочее время студии:\n" + db.get_working_hours_text())
+        await callback.message.edit_text(
+            working_hours_menu_text(db),
+            reply_markup=working_hours_keyboard(db),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data == "menu:back")
+    async def menu_back(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id, config):
+            await callback.answer("Недостаточно прав", show_alert=True)
+            return
+        current_mode = db.get_setting("bot_mode", config.default_mode)
+        await callback.message.edit_text(
+            mode_menu_text(db, config),
+            reply_markup=mode_menu_keyboard(current_mode),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("hours:edit:"))
+    async def edit_working_hours(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id, config):
+            await callback.answer("Недостаточно прав", show_alert=True)
+            return
+        try:
+            weekday = int(callback.data.rsplit(":", maxsplit=1)[1])
+        except (TypeError, ValueError):
+            await callback.answer("Некорректный день", show_alert=True)
+            return
+        if weekday not in range(7):
+            await callback.answer("Некорректный день", show_alert=True)
+            return
+        day_name = WEEKDAY_LABELS[weekday]
+        await callback.message.answer(
+            f"{HOURS_PROMPT_PREFIX}{day_name}\n"
+            "Введите интервал в формате 09:00-18:00. "
+            "Если администратор не работает в этот день, напишите «выходной».",
+            reply_markup=ForceReply(
+                selective=True,
+                input_field_placeholder="Например: 09:00-18:00",
+            ),
+        )
         await callback.answer()
 
     @router.callback_query(F.data.startswith("chat:"))
