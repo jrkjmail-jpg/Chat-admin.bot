@@ -65,9 +65,9 @@ def parse_int_set(value: str | None) -> set[int]:
 
 
 def load_config() -> Config:
-    token = os.getenv("BOT_TOKEN", "").strip()
+    token = (os.getenv("TG_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
     if not token:
-        raise RuntimeError("BOT_TOKEN is required")
+        raise RuntimeError("TG_BOT_TOKEN or BOT_TOKEN is required")
     return Config(
         bot_token=token,
         openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
