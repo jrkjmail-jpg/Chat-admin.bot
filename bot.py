@@ -6,19 +6,23 @@ import os
 import re
 import sqlite3
 import tempfile
+import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
+import xlrd
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import BotCommand, CallbackQuery, ChatMemberUpdated, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from docx import Document as WordDocument
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from openpyxl import load_workbook
 from pypdf import PdfReader
 
 load_dotenv()
@@ -30,6 +34,9 @@ ACTIVE_PARENT_STATUS = "✅ Активен как родительский ча�
 MODERATION_ONLY_STATUS = "🛡 Активен только как модератор"
 IGNORED_STATUS = "⏸ Не подключён"
 MESSAGE_BUFFER_SECONDS = float(os.getenv("MESSAGE_BUFFER_SECONDS", "4"))
+MAX_KNOWLEDGE_FILE_BYTES = int(os.getenv("MAX_KNOWLEDGE_FILE_MB", "10")) * 1024 * 1024
+MAX_EXTRACTED_TEXT_CHARS = int(os.getenv("MAX_EXTRACTED_TEXT_CHARS", "50000"))
+MAX_OFFICE_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
 MODE_LABELS = {
     "always": "🟢 Включён вручную",
     "outside_working_hours": "🕒 Автоматически после смены администратора",
@@ -315,11 +322,112 @@ async def download_to_temp(bot: Bot, file_id: str, suffix: str) -> str:
     return temp_path
 
 
-async def extract_pdf_text(bot: Bot, file_id: str) -> str:
-    temp_path = await download_to_temp(bot, file_id, ".pdf")
+def limited_text(lines: list[str]) -> str:
+    selected: list[str] = []
+    total = 0
+    for raw_line in lines:
+        line = str(raw_line).strip()
+        if not line:
+            continue
+        remaining = MAX_EXTRACTED_TEXT_CHARS - total
+        if remaining <= 0:
+            break
+        selected.append(line[:remaining])
+        total += len(selected[-1]) + 1
+    return "\n".join(selected)
+
+
+def validate_office_archive(path: str) -> None:
     try:
-        reader = PdfReader(temp_path)
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
+        with zipfile.ZipFile(path) as archive:
+            members = archive.infolist()
+            total_size = sum(member.file_size for member in members)
+            if len(members) > 5000 or total_size > MAX_OFFICE_UNCOMPRESSED_BYTES:
+                raise ValueError("Office document is too large after unpacking")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("Invalid Office document") from exc
+
+
+def extract_pdf_text(path: str) -> str:
+    reader = PdfReader(path)
+    return limited_text([page.extract_text() or "" for page in reader.pages])
+
+
+def extract_docx_text(path: str) -> str:
+    validate_office_archive(path)
+    document = WordDocument(path)
+    lines = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
+    for table_index, table in enumerate(document.tables, start=1):
+        lines.append(f"Таблица {table_index}:")
+        for row in table.rows:
+            values = [normalize_text(cell.text) for cell in row.cells]
+            if any(values):
+                lines.append(" | ".join(values))
+    return limited_text(lines)
+
+
+def extract_xlsx_text(path: str) -> str:
+    validate_office_archive(path)
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    lines: list[str] = []
+    try:
+        for worksheet in workbook.worksheets:
+            lines.append(f"Лист: {worksheet.title}")
+            for row in worksheet.iter_rows(values_only=True):
+                values = [str(value).strip() if value is not None else "" for value in row]
+                if any(values):
+                    lines.append(" | ".join(values))
+                if sum(len(line) + 1 for line in lines) >= MAX_EXTRACTED_TEXT_CHARS:
+                    return limited_text(lines)
+    finally:
+        workbook.close()
+    return limited_text(lines)
+
+
+def extract_xls_text(path: str) -> str:
+    workbook = xlrd.open_workbook(path, on_demand=True)
+    lines: list[str] = []
+    try:
+        for worksheet in workbook.sheets():
+            lines.append(f"Лист: {worksheet.name}")
+            for row_index in range(worksheet.nrows):
+                values = [str(worksheet.cell_value(row_index, column)).strip() for column in range(worksheet.ncols)]
+                if any(values):
+                    lines.append(" | ".join(values))
+                if sum(len(line) + 1 for line in lines) >= MAX_EXTRACTED_TEXT_CHARS:
+                    return limited_text(lines)
+    finally:
+        workbook.release_resources()
+    return limited_text(lines)
+
+
+def document_kind(file_name: str | None, mime_type: str | None) -> str | None:
+    suffix = Path(file_name or "").suffix.lower()
+    by_suffix = {".pdf": "pdf", ".docx": "docx", ".xlsx": "xlsx", ".xls": "xls"}
+    if suffix in by_suffix:
+        return by_suffix[suffix]
+    by_mime = {
+        "application/pdf": "pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+        "application/vnd.ms-excel": "xls",
+    }
+    return by_mime.get(mime_type or "")
+
+
+async def extract_uploaded_document(bot: Bot, file_id: str, file_name: str | None, mime_type: str | None) -> str:
+    kind = document_kind(file_name, mime_type)
+    if not kind:
+        return ""
+    temp_path = await download_to_temp(bot, file_id, f".{kind}")
+    try:
+        if kind == "pdf":
+            return extract_pdf_text(temp_path)
+        if kind == "docx":
+            return extract_docx_text(temp_path)
+        if kind == "xlsx":
+            return extract_xlsx_text(temp_path)
+        return extract_xls_text(temp_path)
     finally:
         Path(temp_path).unlink(missing_ok=True)
 
@@ -689,9 +797,32 @@ async def main() -> None:
         if message.text and not message.text.startswith("/"):
             raw_text = message.text
             title = raw_text[:80]
-        elif message.document and message.document.mime_type == "application/pdf":
-            raw_text = await extract_pdf_text(bot, message.document.file_id)
-            title = message.document.file_name or "PDF-документ"
+        elif message.document:
+            kind = document_kind(message.document.file_name, message.document.mime_type)
+            if not kind:
+                await message.answer(
+                    "Поддерживаются документы PDF, Word (.docx) и Excel (.xlsx, .xls)."
+                )
+                return True
+            if message.document.file_size and message.document.file_size > MAX_KNOWLEDGE_FILE_BYTES:
+                limit_mb = MAX_KNOWLEDGE_FILE_BYTES // (1024 * 1024)
+                await message.answer(f"Файл слишком большой. Максимальный размер — {limit_mb} МБ.")
+                return True
+            try:
+                raw_text = await extract_uploaded_document(
+                    bot,
+                    message.document.file_id,
+                    message.document.file_name,
+                    message.document.mime_type,
+                )
+            except Exception as exc:
+                logger.exception("Cannot extract document %s: %s", message.document.file_name, exc)
+                await message.answer(
+                    "Не удалось прочитать документ. Проверьте, что файл не повреждён "
+                    "и сохранён в формате PDF, DOCX, XLSX или XLS."
+                )
+                return True
+            title = message.document.file_name or f"{kind.upper()}-документ"
         elif message.photo:
             path = await download_to_temp(bot, message.photo[-1].file_id, ".jpg")
             try:
@@ -707,7 +838,10 @@ async def main() -> None:
             finally:
                 Path(path).unlink(missing_ok=True)
         else:
-            await message.answer("Пока я могу добавлять в базу текст, PDF, изображения и голосовые сообщения.")
+            await message.answer(
+                "Можно добавлять текст, PDF, Word (.docx), Excel (.xlsx, .xls), "
+                "изображения и голосовые сообщения."
+            )
             return True
         if not normalize_text(raw_text):
             await message.answer("Не удалось извлечь текст из материала.")
