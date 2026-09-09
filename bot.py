@@ -16,7 +16,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BotCommand, CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from pypdf import PdfReader
@@ -30,6 +30,12 @@ ACTIVE_PARENT_STATUS = "✅ Активен как родительский ча�
 MODERATION_ONLY_STATUS = "🛡 Активен только как модератор"
 IGNORED_STATUS = "⏸ Не подключён"
 MESSAGE_BUFFER_SECONDS = float(os.getenv("MESSAGE_BUFFER_SECONDS", "4"))
+MODE_LABELS = {
+    "always": "🟢 Всегда включён",
+    "outside_working_hours": "🌙 Только вне рабочего времени",
+    "working_hours_only": "☀️ Только в рабочее время",
+    "off": "🔴 Ответы выключены",
+}
 
 
 @dataclass(frozen=True)
@@ -340,6 +346,36 @@ def bot_is_active(db: Database, config: Config) -> bool:
     return True
 
 
+def mode_menu_keyboard(current_mode: str) -> InlineKeyboardMarkup:
+    def mode_button(mode: str, label: str) -> InlineKeyboardButton:
+        prefix = "✅ " if current_mode == mode else ""
+        return InlineKeyboardButton(text=prefix + label, callback_data=f"mode:{mode}")
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [mode_button("always", "Всегда")],
+        [mode_button("outside_working_hours", "Вне рабочего времени")],
+        [mode_button("working_hours_only", "В рабочее время")],
+        [mode_button("off", "Выключить ответы")],
+        [InlineKeyboardButton(text="🕒 Показать рабочее время", callback_data="menu:hours")],
+    ])
+
+
+def mode_menu_text(db: Database, config: Config) -> str:
+    current_mode = db.get_setting("bot_mode", config.default_mode)
+    current_label = MODE_LABELS.get(current_mode, current_mode)
+    reply_status = "отвечает родителям" if bot_is_active(db, config) else "сейчас не отвечает родителям"
+    return (
+        "⚙️ Меню AI-администратора\n\n"
+        f"Текущий режим: {current_label}\n"
+        f"Статус сейчас: {reply_status}.\n\n"
+        "Выберите режим кнопкой ниже.\n\n"
+        "Другие команды:\n"
+        "/hours — показать рабочее время\n"
+        "/set_service_chat — назначить сервисный чат\n"
+        "/add_parent_chat — назначить родительский чат"
+    )
+
+
 async def notify_admins(bot: Bot, config: Config, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
     for admin_id in config.admin_ids:
         try:
@@ -366,13 +402,38 @@ async def main() -> None:
     ai = OpenAIService(config)
     bot = Bot(config.bot_token)
     me = await bot.get_me()
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Запустить бота"),
+        BotCommand(command="menu", description="Открыть меню администратора"),
+        BotCommand(command="hours", description="Показать рабочее время"),
+    ])
     dp = Dispatcher()
     router = Router()
     message_buffers: dict[tuple[int, int], dict[str, object]] = {}
 
     @router.message(Command("start"))
     async def start(message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else None
+        if is_admin(user_id, config):
+            current_mode = db.get_setting("bot_mode", config.default_mode)
+            await message.answer(
+                mode_menu_text(db, config),
+                reply_markup=mode_menu_keyboard(current_mode),
+            )
+            return
         await message.answer(f"Здравствуйте! Я AI-администратор студии {config.studio_name}.")
+
+    @router.message(Command("menu"))
+    async def admin_menu(message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else None
+        if not is_admin(user_id, config):
+            await message.answer("Меню управления доступно только администраторам.")
+            return
+        current_mode = db.get_setting("bot_mode", config.default_mode)
+        await message.answer(
+            mode_menu_text(db, config),
+            reply_markup=mode_menu_keyboard(current_mode),
+        )
 
     @router.my_chat_member()
     async def bot_added(event: ChatMemberUpdated) -> None:
@@ -410,17 +471,54 @@ async def main() -> None:
         if not is_admin(message.from_user.id if message.from_user else None, config):
             return
         parts = (message.text or "").split(maxsplit=1)
-        allowed = {"always", "outside_working_hours", "working_hours_only", "off"}
-        if len(parts) != 2 or parts[1] not in allowed:
-            await message.answer("Используйте: /mode always|outside_working_hours|working_hours_only|off")
+        if len(parts) == 1:
+            current_mode = db.get_setting("bot_mode", config.default_mode)
+            await message.answer(
+                mode_menu_text(db, config),
+                reply_markup=mode_menu_keyboard(current_mode),
+            )
+            return
+        if parts[1] not in MODE_LABELS:
+            await message.answer("Неизвестный режим. Откройте /menu и выберите режим кнопкой.")
             return
         db.set_setting("bot_mode", parts[1])
-        await message.answer(f"Режим работы бота изменён: {parts[1]}")
+        await message.answer(
+            mode_menu_text(db, config),
+            reply_markup=mode_menu_keyboard(parts[1]),
+        )
 
     @router.message(Command("hours"))
     async def hours(message: Message) -> None:
         if is_admin(message.from_user.id if message.from_user else None, config):
             await message.answer("Рабочее время студии:\n" + db.get_working_hours_text())
+
+    @router.callback_query(F.data.startswith("mode:"))
+    async def mode_callback(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id, config):
+            await callback.answer("Недостаточно прав", show_alert=True)
+            return
+        _, selected_mode = callback.data.split(":", maxsplit=1)
+        if selected_mode not in MODE_LABELS:
+            await callback.answer("Неизвестный режим", show_alert=True)
+            return
+        current_mode = db.get_setting("bot_mode", config.default_mode)
+        if selected_mode == current_mode:
+            await callback.answer("Этот режим уже включён")
+            return
+        db.set_setting("bot_mode", selected_mode)
+        await callback.message.edit_text(
+            mode_menu_text(db, config),
+            reply_markup=mode_menu_keyboard(selected_mode),
+        )
+        await callback.answer("Режим изменён")
+
+    @router.callback_query(F.data == "menu:hours")
+    async def menu_hours(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id, config):
+            await callback.answer("Недостаточно прав", show_alert=True)
+            return
+        await callback.message.answer("Рабочее время студии:\n" + db.get_working_hours_text())
+        await callback.answer()
 
     @router.callback_query(F.data.startswith("chat:"))
     async def chat_callback(callback: CallbackQuery) -> None:
