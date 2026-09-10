@@ -145,6 +145,9 @@ class Database:
         row = self.conn.execute("SELECT type FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
         return row["type"] if row else None
 
+    def get_chat_record(self, chat_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
+
     def responds_to_all_messages(self, chat_id: int) -> bool:
         row = self.conn.execute("SELECT respond_to_all FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
         return bool(row and row["respond_to_all"])
@@ -158,6 +161,11 @@ class Database:
 
     def list_active_chats(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM chats WHERE type IN ('parent', 'moderation') ORDER BY title").fetchall()
+
+    def list_parent_chats(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM chats WHERE type = 'parent' ORDER BY title, chat_id"
+        ).fetchall()
 
     def add_pending_knowledge(self, title: str, content: str, chat_id: int | None, message_id: int | None) -> int:
         cur = self.conn.execute("INSERT INTO pending_knowledge(title, content, source_chat_id, source_message_id, created_at) VALUES(?, ?, ?, ?, ?)", (title, content, chat_id, message_id, utc_now()))
@@ -566,7 +574,7 @@ def bot_is_active(db: Database, config: Config) -> bool:
     return True
 
 
-def mode_menu_keyboard(db: Database, current_mode: str, chat_id: int | None = None) -> InlineKeyboardMarkup:
+def mode_menu_keyboard(current_mode: str, include_chat_settings: bool = False) -> InlineKeyboardMarkup:
     def mode_button(mode: str, label: str) -> InlineKeyboardButton:
         prefix = "✅ " if current_mode == mode else ""
         return InlineKeyboardButton(text=prefix + label, callback_data=f"mode:{mode}")
@@ -577,11 +585,54 @@ def mode_menu_keyboard(db: Database, current_mode: str, chat_id: int | None = No
         [mode_button("off", "🔴 Выключить сейчас")],
         [InlineKeyboardButton(text="⚙️ Настроить график администратора", callback_data="menu:hours")],
     ]
-    if chat_id is not None:
-        enabled = db.responds_to_all_messages(chat_id)
-        label = "✅ Отвечать на каждое сообщение" if enabled else "💬 Отвечать на каждое сообщение"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"chat_all:toggle:{chat_id}")])
+    if include_chat_settings:
+        rows.append([
+            InlineKeyboardButton(
+                text="💬 Настроить ответы по чатам",
+                callback_data="menu:chats",
+            )
+        ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def parent_chats_keyboard(db: Database) -> InlineKeyboardMarkup:
+    rows = []
+    for row in db.list_parent_chats():
+        enabled = bool(row["respond_to_all"])
+        marker = "✅" if enabled else "▫️"
+        title = normalize_text(str(row["title"] or row["chat_id"]))[:42]
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{marker} {title}",
+                callback_data=f"chat_settings:{row['chat_id']}",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def chat_settings_keyboard(chat_id: int, enabled: bool) -> InlineKeyboardMarkup:
+    toggle_text = (
+        "🔴 Выключить ответы на каждое сообщение"
+        if enabled
+        else "🟢 Включить ответы на каждое сообщение"
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle_text, callback_data=f"chat_all:toggle:{chat_id}")],
+        [InlineKeyboardButton(text="⬅️ К списку чатов", callback_data="menu:chats")],
+    ])
+
+
+def chat_settings_text(row: sqlite3.Row) -> str:
+    state = "включены" if row["respond_to_all"] else "выключены"
+    return (
+        "💬 Ответы на каждое сообщение\n\n"
+        f"Чат: {row['title'] or row['chat_id']}\n"
+        f"Chat ID: {row['chat_id']}\n"
+        f"Сейчас: {state}.\n\n"
+        "Если включить эту настройку, бот будет кратко отвечать даже на обычные реплики. "
+        "Общий режим и график администратора продолжают действовать."
+    )
 
 
 def working_hours_keyboard(db: Database) -> InlineKeyboardMarkup:
@@ -620,21 +671,16 @@ def parse_working_hours(value: str) -> tuple[str | None, str | None, bool] | Non
     return start_value.strftime("%H:%M"), end_value.strftime("%H:%M"), True
 
 
-def mode_menu_text(db: Database, config: Config, chat_id: int | None = None) -> str:
+def mode_menu_text(db: Database, config: Config) -> str:
     current_mode = db.get_setting("bot_mode", config.default_mode)
     current_label = MODE_LABELS.get(current_mode, current_mode)
     admin_status = "на рабочем месте" if db.is_admin_working_now(config.timezone) else "не на рабочем месте"
     reply_status = "отвечает родителям" if bot_is_active(db, config) else "не отвечает родителям"
-    chat_setting = ""
-    if chat_id is not None:
-        all_status = "включены" if db.responds_to_all_messages(chat_id) else "выключены"
-        chat_setting = f"\nОтветы на каждое сообщение в этом чате: {all_status}."
     return (
         "⚙️ Меню AI-администратора\n\n"
         f"Режим: {current_label}\n"
         f"По графику администратор сейчас: {admin_status}.\n"
-        f"Бот сейчас: {reply_status}."
-        f"{chat_setting}\n\n"
+        f"Бот сейчас: {reply_status}.\n\n"
         "Можно включить или выключить бота вручную либо выбрать автоматическую работу после смены."
     )
 
@@ -674,18 +720,15 @@ async def main() -> None:
     router = Router()
     message_buffers: dict[tuple[int, int], dict[str, object]] = {}
 
-    def menu_parent_chat_id(chat_id: int) -> int | None:
-        return chat_id if db.get_chat_type(chat_id) == "parent" else None
-
     @router.message(Command("start"))
     async def start(message: Message) -> None:
         user_id = message.from_user.id if message.from_user else None
         if is_admin(user_id, config):
             current_mode = db.get_setting("bot_mode", config.default_mode)
-            menu_chat_id = menu_parent_chat_id(message.chat.id)
+            private_menu = message.chat.type == ChatType.PRIVATE
             await message.answer(
-                mode_menu_text(db, config, menu_chat_id),
-                reply_markup=mode_menu_keyboard(db, current_mode, menu_chat_id),
+                mode_menu_text(db, config),
+                reply_markup=mode_menu_keyboard(current_mode, private_menu),
             )
             return
         await message.answer(f"Здравствуйте! Я AI-администратор студии {config.studio_name}.")
@@ -697,10 +740,10 @@ async def main() -> None:
             await message.answer("Меню управления доступно только администраторам.")
             return
         current_mode = db.get_setting("bot_mode", config.default_mode)
-        menu_chat_id = menu_parent_chat_id(message.chat.id)
+        private_menu = message.chat.type == ChatType.PRIVATE
         await message.answer(
-            mode_menu_text(db, config, menu_chat_id),
-            reply_markup=mode_menu_keyboard(db, current_mode, menu_chat_id),
+            mode_menu_text(db, config),
+            reply_markup=mode_menu_keyboard(current_mode, private_menu),
         )
 
     @router.my_chat_member()
@@ -741,20 +784,20 @@ async def main() -> None:
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) == 1:
             current_mode = db.get_setting("bot_mode", config.default_mode)
-            menu_chat_id = menu_parent_chat_id(message.chat.id)
+            private_menu = message.chat.type == ChatType.PRIVATE
             await message.answer(
-                mode_menu_text(db, config, menu_chat_id),
-                reply_markup=mode_menu_keyboard(db, current_mode, menu_chat_id),
+                mode_menu_text(db, config),
+                reply_markup=mode_menu_keyboard(current_mode, private_menu),
             )
             return
         if parts[1] not in MODE_LABELS:
             await message.answer("Неизвестный режим. Откройте /menu и выберите режим кнопкой.")
             return
         db.set_setting("bot_mode", parts[1])
-        menu_chat_id = menu_parent_chat_id(message.chat.id)
+        private_menu = message.chat.type == ChatType.PRIVATE
         await message.answer(
-            mode_menu_text(db, config, menu_chat_id),
-            reply_markup=mode_menu_keyboard(db, parts[1], menu_chat_id),
+            mode_menu_text(db, config),
+            reply_markup=mode_menu_keyboard(parts[1], private_menu),
         )
 
     @router.message(Command("hours"))
@@ -806,10 +849,10 @@ async def main() -> None:
             await callback.answer("Этот режим уже включён")
             return
         db.set_setting("bot_mode", selected_mode)
-        menu_chat_id = menu_parent_chat_id(callback.message.chat.id)
+        private_menu = callback.message.chat.type == ChatType.PRIVATE
         await callback.message.edit_text(
-            mode_menu_text(db, config, menu_chat_id),
-            reply_markup=mode_menu_keyboard(db, selected_mode, menu_chat_id),
+            mode_menu_text(db, config),
+            reply_markup=mode_menu_keyboard(selected_mode, private_menu),
         )
         await callback.answer("Режим изменён")
 
@@ -830,10 +873,10 @@ async def main() -> None:
             await callback.answer("Недостаточно прав", show_alert=True)
             return
         current_mode = db.get_setting("bot_mode", config.default_mode)
-        menu_chat_id = menu_parent_chat_id(callback.message.chat.id)
+        private_menu = callback.message.chat.type == ChatType.PRIVATE
         await callback.message.edit_text(
-            mode_menu_text(db, config, menu_chat_id),
-            reply_markup=mode_menu_keyboard(db, current_mode, menu_chat_id),
+            mode_menu_text(db, config),
+            reply_markup=mode_menu_keyboard(current_mode, private_menu),
         )
         await callback.answer()
 
@@ -862,46 +905,87 @@ async def main() -> None:
         )
         await callback.answer()
 
-    @router.callback_query(F.data.startswith("chat_all:toggle:"))
-    async def toggle_respond_to_all(callback: CallbackQuery) -> None:
+    @router.callback_query(F.data == "menu:chats")
+    async def parent_chats_menu(callback: CallbackQuery) -> None:
         if not is_admin(callback.from_user.id, config):
             await callback.answer("Недостаточно прав", show_alert=True)
+            return
+        if callback.message.chat.type != ChatType.PRIVATE:
+            await callback.answer(
+                "Настройки чатов доступны только в личном чате с ботом.",
+                show_alert=True,
+            )
+            return
+        chats = db.list_parent_chats()
+        text = (
+            "💬 Настройка ответов по чатам\n\n"
+            "Выберите родительскую группу. Галочка означает, что ответы "
+            "на каждое сообщение включены."
+            if chats
+            else "Родительские группы пока не подключены."
+        )
+        await callback.message.edit_text(text, reply_markup=parent_chats_keyboard(db))
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("chat_settings:"))
+    async def open_chat_settings(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id, config):
+            await callback.answer("Недостаточно прав", show_alert=True)
+            return
+        if callback.message.chat.type != ChatType.PRIVATE:
+            await callback.answer(
+                "Настройки чатов доступны только в личном чате с ботом.",
+                show_alert=True,
+            )
             return
         try:
             chat_id = int(callback.data.rsplit(":", maxsplit=1)[1])
         except (TypeError, ValueError):
             await callback.answer("Некорректный чат", show_alert=True)
             return
-        if db.get_chat_type(chat_id) != "parent":
+        row = db.get_chat_record(chat_id)
+        if not row or row["type"] != "parent":
+            await callback.answer("Родительский чат не найден", show_alert=True)
+            return
+        enabled = bool(row["respond_to_all"])
+        await callback.message.edit_text(
+            chat_settings_text(row),
+            reply_markup=chat_settings_keyboard(chat_id, enabled),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("chat_all:toggle:"))
+    async def toggle_respond_to_all(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id, config):
+            await callback.answer("Недостаточно прав", show_alert=True)
+            return
+        if callback.message.chat.type != ChatType.PRIVATE:
+            await callback.answer(
+                "Настройка доступна только в личном чате с ботом.",
+                show_alert=True,
+            )
+            return
+        try:
+            chat_id = int(callback.data.rsplit(":", maxsplit=1)[1])
+        except (TypeError, ValueError):
+            await callback.answer("Некорректный чат", show_alert=True)
+            return
+        row = db.get_chat_record(chat_id)
+        if not row or row["type"] != "parent":
             await callback.answer(
                 "Сначала включите для этого чата режим «Родительский чат».",
                 show_alert=True,
             )
             return
 
-        enabled = not db.responds_to_all_messages(chat_id)
+        enabled = not bool(row["respond_to_all"])
         db.set_respond_to_all_messages(chat_id, enabled)
+        updated_row = db.get_chat_record(chat_id)
+        await callback.message.edit_text(
+            chat_settings_text(updated_row),
+            reply_markup=chat_settings_keyboard(chat_id, enabled),
+        )
         state_text = "включены" if enabled else "выключены"
-
-        if callback.message.chat.id == chat_id:
-            current_mode = db.get_setting("bot_mode", config.default_mode)
-            await callback.message.edit_text(
-                mode_menu_text(db, config, chat_id),
-                reply_markup=mode_menu_keyboard(db, current_mode, chat_id),
-            )
-        else:
-            try:
-                chat = await bot.get_chat(chat_id)
-                title = chat.title or "Без названия"
-            except Exception:
-                title = "Без названия"
-            await callback.message.edit_text(
-                f"Чат: {title}\n"
-                f"Chat ID: {chat_id}\n"
-                f"Статус: {ACTIVE_PARENT_STATUS}\n"
-                f"Ответы на каждое сообщение: {state_text}.",
-                reply_markup=chat_control_keyboard(chat_id),
-            )
         await callback.answer(f"Ответы на каждое сообщение {state_text}")
 
     @router.callback_query(F.data.startswith("chat:"))
